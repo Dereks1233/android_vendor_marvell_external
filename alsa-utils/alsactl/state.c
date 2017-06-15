@@ -31,9 +31,6 @@
 #include "alsactl.h"
 
 
-#define ARRAY_SIZE(a) (sizeof (a) / sizeof (a)[0])
-
-
 static char *id_str(snd_ctl_elem_id_t *id)
 {
 	static char str[128];
@@ -58,15 +55,10 @@ static int snd_config_integer_add(snd_config_t *father, char *id, long integer)
 {
 	int err;
 	snd_config_t *leaf;
-	err = snd_config_make_integer(&leaf, id);
+	err = snd_config_imake_integer(&leaf, id, integer);
 	if (err < 0)
 		return err;
 	err = snd_config_add(father, leaf);
-	if (err < 0) {
-		snd_config_delete(leaf);
-		return err;
-	}
-	err = snd_config_set_integer(leaf, integer);
 	if (err < 0) {
 		snd_config_delete(leaf);
 		return err;
@@ -78,15 +70,10 @@ static int snd_config_integer64_add(snd_config_t *father, char *id, long long in
 {
 	int err;
 	snd_config_t *leaf;
-	err = snd_config_make_integer64(&leaf, id);
+	err = snd_config_imake_integer64(&leaf, id, integer);
 	if (err < 0)
 		return err;
 	err = snd_config_add(father, leaf);
-	if (err < 0) {
-		snd_config_delete(leaf);
-		return err;
-	}
-	err = snd_config_set_integer64(leaf, integer);
 	if (err < 0) {
 		snd_config_delete(leaf);
 		return err;
@@ -98,15 +85,10 @@ static int snd_config_string_add(snd_config_t *father, const char *id, const cha
 {
 	int err;
 	snd_config_t *leaf;
-	err = snd_config_make_string(&leaf, id);
+	err = snd_config_imake_string(&leaf, id, string);
 	if (err < 0)
 		return err;
 	err = snd_config_add(father, leaf);
-	if (err < 0) {
-		snd_config_delete(leaf);
-		return err;
-	}
-	err = snd_config_set_string(leaf, string);
 	if (err < 0) {
 		snd_config_delete(leaf);
 		return err;
@@ -179,14 +161,18 @@ static unsigned int *str_to_tlv(const char *s)
 }
 
 /*
- * add the TLV string and dB ranges to comment fields
+ * add the TLV string, dB ranges, and dB values to comment fields
  */
 static int add_tlv_comments(snd_ctl_t *handle, snd_ctl_elem_id_t *id,
-			    snd_ctl_elem_info_t *info, snd_config_t *comment)
+			    snd_ctl_elem_info_t *info, snd_ctl_elem_value_t *ctl,
+			    snd_config_t *comment)
 {
 	unsigned int tlv[MAX_USER_TLV_SIZE];
 	unsigned int *db;
-	long dbmin, dbmax;
+	long rangemin, rangemax;
+	long dbmin, dbmax, dbgain;
+	snd_config_t *value;
+	unsigned int i, count;
 	int err;
 
 	if (snd_ctl_elem_tlv_read(handle, id, tlv, sizeof(tlv)) < 0)
@@ -196,11 +182,11 @@ static int add_tlv_comments(snd_ctl_t *handle, snd_ctl_elem_id_t *id,
 		char *s = tlv_to_str(tlv);
 		if (s) {
 			err = snd_config_string_add(comment, "tlv", s);
+			free(s);
 			if (err < 0) {
 				error("snd_config_string_add: %s", snd_strerror(err));
 				return err;
 			}
-			free(s);
 		}
 	}
 
@@ -208,13 +194,35 @@ static int add_tlv_comments(snd_ctl_t *handle, snd_ctl_elem_id_t *id,
 	if (err <= 0)
 		return 0;
 
-	snd_tlv_get_dB_range(db, snd_ctl_elem_info_get_min(info),
-			     snd_ctl_elem_info_get_max(info),
-			     &dbmin, &dbmax);
+	rangemin = snd_ctl_elem_info_get_min(info);
+	rangemax = snd_ctl_elem_info_get_max(info);
+	snd_tlv_get_dB_range(db, rangemin, rangemax, &dbmin, &dbmax);
 	if (err < 0)
 		return err;
 	snd_config_integer_add(comment, "dbmin", dbmin);
 	snd_config_integer_add(comment, "dbmax", dbmax);
+
+	if (snd_ctl_elem_info_get_type(info) == SND_CTL_ELEM_TYPE_INTEGER) {
+		err = snd_config_compound_add(comment, "dbvalue", 1, &value);
+		if (err < 0) {
+			error("snd_config_compound_add: %s", snd_strerror(err));
+			return err;
+		}
+		count = snd_ctl_elem_info_get_count(info);
+		for (i = 0; i < count; i++) {
+			err = snd_tlv_convert_to_dB(db, rangemin, rangemax,
+					snd_ctl_elem_value_get_integer(ctl, i), &dbgain);
+			if (err < 0) {
+				error("snd_tlv_convert_to_dB: %s", snd_strerror(err));
+				return err;
+			}
+			err = snd_config_integer_add(value, num_str(i), dbgain);
+			if (err < 0) {
+				error("snd_config_integer_add: %s", snd_strerror(err));
+				return err;
+			}
+		}
+	}
 	return 0;
 }
 
@@ -240,8 +248,7 @@ static int get_control(snd_ctl_t *handle, snd_ctl_elem_id_t *id, snd_config_t *t
 		return err;
 	}
 
-	if (snd_ctl_elem_info_is_inactive(info) ||
-				!snd_ctl_elem_info_is_readable(info))
+	if (!snd_ctl_elem_info_is_readable(info))
 		return 0;
 	snd_ctl_elem_value_set_id(ctl, id);
 	err = snd_ctl_elem_read(handle, ctl);
@@ -255,9 +262,9 @@ static int get_control(snd_ctl_t *handle, snd_ctl_elem_id_t *id, snd_config_t *t
 		error("snd_config_compound_add: %s", snd_strerror(err));
 		return err;
 	}
-	err = snd_config_compound_add(control, "comment", 1, &comment);
+	err = snd_config_make_compound(&comment, "comment", 0);
 	if (err < 0) {
-		error("snd_config_compound_add: %s", snd_strerror(err));
+		error("snd_config_make_compound: %s", snd_strerror(err));
 		return err;
 	}
 
@@ -317,7 +324,7 @@ static int get_control(snd_ctl_t *handle, snd_ctl_elem_id_t *id, snd_config_t *t
 			return err;
 		}
 		if (snd_ctl_elem_info_is_tlv_readable(info)) {
-			err = add_tlv_comments(handle, id, info, comment);
+			err = add_tlv_comments(handle, id, info, ctl, comment);
 			if (err < 0)
 				return err;
 		}
@@ -421,7 +428,7 @@ static int get_control(snd_ctl_t *handle, snd_ctl_elem_id_t *id, snd_config_t *t
 			error("snd_config_string_add: %s", snd_strerror(err));
 			return err;
 		}
-		return 0;
+		goto finish;
 	}
 	default:
 		break;
@@ -435,21 +442,21 @@ static int get_control(snd_ctl_t *handle, snd_ctl_elem_id_t *id, snd_config_t *t
 				error("snd_config_string_add: %s", snd_strerror(err));
 				return err;
 			}
-			return 0;
+			goto finish;
 		case SND_CTL_ELEM_TYPE_INTEGER:
 			err = snd_config_integer_add(control, "value", snd_ctl_elem_value_get_integer(ctl, 0));
 			if (err < 0) {
 				error("snd_config_integer_add: %s", snd_strerror(err));
 				return err;
 			}
-			return 0;
+			goto finish;
 		case SND_CTL_ELEM_TYPE_INTEGER64:
 			err = snd_config_integer64_add(control, "value", snd_ctl_elem_value_get_integer64(ctl, 0));
 			if (err < 0) {
 				error("snd_config_integer64_add: %s", snd_strerror(err));
 				return err;
 			}
-			return 0;
+			goto finish;
 		case SND_CTL_ELEM_TYPE_ENUMERATED:
 		{
 			unsigned int v = snd_ctl_elem_value_get_enumerated(ctl, 0);
@@ -464,7 +471,7 @@ static int get_control(snd_ctl_t *handle, snd_ctl_elem_id_t *id, snd_config_t *t
 			}
 			if (err < 0)
 				error("snd_config add: %s", snd_strerror(err));
-			return 0;
+			goto finish;
 		}
 		default:
 			error("Unknown control type: %d\n", type);
@@ -529,6 +536,12 @@ static int get_control(snd_ctl_t *handle, snd_ctl_elem_id_t *id, snd_config_t *t
 		return -EINVAL;
 	}
 	
+finish:
+	err = snd_config_add(control, comment);
+	if (err < 0) {
+		error("snd_config_add: %s", snd_strerror(err));
+		return err;
+	}
 	return 0;
 }
 	
@@ -538,6 +551,7 @@ static int get_controls(int cardno, snd_config_t *top)
 	snd_ctl_card_info_t *info;
 	snd_config_t *state, *card, *control;
 	snd_ctl_elem_list_t *list;
+	snd_ctl_elem_id_t *elem_id;
 	unsigned int idx;
 	int err;
 	char name[32];
@@ -545,6 +559,7 @@ static int get_controls(int cardno, snd_config_t *top)
 	const char *id;
 	snd_ctl_card_info_alloca(&info);
 	snd_ctl_elem_list_alloca(&list);
+	snd_ctl_elem_id_alloca(&elem_id);
 
 	sprintf(name, "hw:%d", cardno);
 	err = snd_ctl_open(&handle, name, SND_CTL_READONLY);
@@ -619,10 +634,8 @@ static int get_controls(int cardno, snd_config_t *top)
 		goto _free;
 	}
 	for (idx = 0; idx < count; ++idx) {
-		snd_ctl_elem_id_t *id;
-		snd_ctl_elem_id_alloca(&id);
-		snd_ctl_elem_list_get_id(list, idx, id);
-		err = get_control(handle, id, control);
+		snd_ctl_elem_list_get_id(list, idx, elem_id);
+		err = get_control(handle, elem_id, control);
 		if (err < 0)
 			goto _free;
 	}		
@@ -761,7 +774,7 @@ static int config_integer64(snd_config_t *n, long long *val, int doit)
 	return err;
 }
 
-static int is_user_control(snd_config_t *conf)
+static int check_comment_access(snd_config_t *conf, const char *str)
 {
 	snd_config_iterator_t i, next;
 
@@ -773,7 +786,7 @@ static int is_user_control(snd_config_t *conf)
 		if (strcmp(id, "access") == 0) {
 			if (snd_config_get_string(n, &s) < 0)
 				return 0;
-			if (strstr(s, "user"))
+			if (strstr(s, str))
 				return 1;
 		}
 	}
@@ -831,6 +844,49 @@ static int get_comment_range(snd_config_t *n, int ctype,
 	return 0;
 }
 
+struct string_array {
+	unsigned int count;
+	const char **strings;
+};
+
+static int get_comment_items(snd_config_t *n, struct string_array *items)
+{
+	snd_config_iterator_t it, next;
+	unsigned int i;
+	int err;
+
+	snd_config_for_each(it, next, n) {
+		snd_config_t *item = snd_config_iterator_entry(it);
+		const char *id;
+		unsigned int numid;
+
+		if (snd_config_get_id(item, &id) < 0)
+			return -EINVAL;
+		numid = atoi(id);
+		if (numid > 999999)
+			return -EINVAL;
+
+		if (numid >= items->count) {
+			const char **strings = realloc(items->strings, (numid + 1) * sizeof(char *));
+			if (!strings)
+				return -ENOMEM;
+			for (i = items->count; i < numid + 1; ++i)
+				strings[i] = NULL;
+			items->count = numid + 1;
+			items->strings = strings;
+		}
+		err = snd_config_get_string(item, &items->strings[numid]);
+		if (err < 0)
+			return err;
+	}
+
+	for (i = 0; i < items->count; ++i)
+		if (!items->strings[i])
+			return -EINVAL;
+
+	return 0;
+}
+
 static int add_user_control(snd_ctl_t *handle, snd_ctl_elem_info_t *info, snd_config_t *conf)
 {
 	snd_ctl_elem_id_t *id;
@@ -838,12 +894,15 @@ static int add_user_control(snd_ctl_t *handle, snd_ctl_elem_info_t *info, snd_co
 	long imin, imax, istep;
 	snd_ctl_elem_type_t ctype;
 	unsigned int count;
+	struct string_array enum_items;
 	int err;
 	unsigned int *tlv;
 
 	imin = imax = istep = 0;
 	count = 0;
 	ctype = SND_CTL_ELEM_TYPE_NONE;
+	enum_items.count = 0;
+	enum_items.strings = NULL;
 	tlv = NULL;
 	snd_config_for_each(i, next, conf) {
 		snd_config_t *n = snd_config_iterator_entry(i);
@@ -853,31 +912,39 @@ static int add_user_control(snd_ctl_t *handle, snd_ctl_elem_info_t *info, snd_co
 		if (strcmp(id, "type") == 0) {
 			err = get_comment_type(n);
 			if (err < 0)
-				return err;
+				goto error;
 			ctype = err;
 			continue;
 		}
 		if (strcmp(id, "range") == 0) {
 			err = get_comment_range(n, ctype, &imin, &imax, &istep);
 			if (err < 0)
-				return err;
+				goto error;
 			continue;
 		}
 		if (strcmp(id, "count") == 0) {
 			long v;
 			if ((err = snd_config_get_integer(n, &v)) < 0)
-				return err;
+				goto error;
 			count = v;
+			continue;
+		}
+		if (strcmp(id, "item") == 0) {
+			err = get_comment_items(n, &enum_items);
+			if (err < 0)
+				goto error;
 			continue;
 		}
 		if (strcmp(id, "tlv") == 0) {
 			const char *s;
 			if ((err = snd_config_get_string(n, &s)) < 0)
-				return -EINVAL;
+				goto error;
 			if (tlv)
 				free(tlv);
-			if ((tlv = str_to_tlv(s)) == NULL)
-				return -EINVAL;
+			if ((tlv = str_to_tlv(s)) == NULL) {
+				err = -EINVAL;
+				goto error;
+			}
 			continue;
 		}
 	}
@@ -888,8 +955,10 @@ static int add_user_control(snd_ctl_t *handle, snd_ctl_elem_info_t *info, snd_co
 		count = 1;
 	switch (ctype) {
 	case SND_CTL_ELEM_TYPE_INTEGER:
-		if (imin > imax || istep > imax - imin)
-			return -EINVAL;
+		if (imin > imax || istep > imax - imin) {
+			err = -EINVAL;
+			goto error;
+		}
 		err = snd_ctl_elem_add_integer(handle, id, count, imin, imax, istep);
 		if (err < 0)
 			goto error;
@@ -898,6 +967,10 @@ static int add_user_control(snd_ctl_t *handle, snd_ctl_elem_info_t *info, snd_co
 		break;
 	case SND_CTL_ELEM_TYPE_BOOLEAN:
 		err = snd_ctl_elem_add_boolean(handle, id, count);
+		break;
+	case SND_CTL_ELEM_TYPE_ENUMERATED:
+		err = snd_ctl_elem_add_enumerated(handle, id, count,
+						  enum_items.count, enum_items.strings);
 		break;
 	case SND_CTL_ELEM_TYPE_IEC958:
 		err = snd_ctl_elem_add_iec958(handle, id);
@@ -909,26 +982,10 @@ static int add_user_control(snd_ctl_t *handle, snd_ctl_elem_info_t *info, snd_co
 
  error:
 	free(tlv);
+	free(enum_items.strings);
 	if (err < 0)
 		return err;
 	return snd_ctl_elem_info(handle, info);
-}
-
-/*
- * look for a config node with the given item name
- */
-static snd_config_t *search_comment_item(snd_config_t *conf, const char *name)
-{
-	snd_config_iterator_t i, next;
-	snd_config_for_each(i, next, conf) {
-		snd_config_t *n = snd_config_iterator_entry(i);
-		const char *id;
-		if (snd_config_get_id(n, &id) < 0)
-			continue;
-		if (strcmp(id, name) == 0)
-			return n;
-	}
-	return NULL;
 }
 
 /*
@@ -936,10 +993,10 @@ static snd_config_t *search_comment_item(snd_config_t *conf, const char *name)
  */
 static int check_comment_type(snd_config_t *conf, int type)
 {
-	snd_config_t *n = search_comment_item(conf, "type");
+	snd_config_t *n;
 	int ctype;
 
-	if (!n)
+	if (snd_config_search(conf, "type", &n) < 0)
 		return 0; /* not defined */
 	ctype = get_comment_type(n);
 	if (ctype == type)
@@ -962,20 +1019,31 @@ static int check_comment_type(snd_config_t *conf, int type)
 static int convert_to_new_db(snd_config_t *value, long omin, long omax,
 			     long nmin, long nmax,
 			     long odbmin, long odbmax,
-			     long ndbmin, long ndbmax,
+			     snd_config_t *comment, const char *index,
+			     snd_ctl_t *device, snd_ctl_elem_id_t *id,
 			     int doit)
 {
-	long val;
-	if (config_integer(value, &val, doit) < 0)
-		return -EINVAL;
-	if (val < omin || val > omax)
-		return -EINVAL;
-	val = ((val - omin) * (odbmax - odbmin)) / (omax - omin) + odbmin;
-	if (val < ndbmin)
-		val = ndbmin;
-	else if (val > ndbmax)
-		val = ndbmax;
-	val = ((val - ndbmin) * (nmax - nmin)) / (ndbmax - ndbmin) + nmin;
+	snd_config_t *db_node;
+	long db, val;
+	int err;
+
+	if (snd_config_searchv(comment, &db_node, "dbvalue", index, NULL) < 0 ||
+	    snd_config_get_integer(db_node, &db) < 0) {
+		err = config_integer(value, &val, doit);
+		if (err < 0)
+			return err;
+		if (val < omin || val > omax)
+			return -EINVAL;
+		db = ((val - omin) * (odbmax - odbmin)) / (omax - omin) + odbmin;
+	}
+
+	err = snd_ctl_convert_from_dB(device, id, db, &val, db > 0);
+	if (err < 0)
+		return err;
+	if (val < nmin)
+		val = nmin;
+	else if (val > nmax)
+		val = nmax;
 	return snd_config_set_integer(value, val);
 }
 
@@ -995,8 +1063,7 @@ static int check_comment_range(snd_ctl_t *handle, snd_config_t *conf,
 	long ndbmin, ndbmax;
 	snd_ctl_elem_id_t *id;
 
-	n = search_comment_item(conf, "range");
-	if (!n)
+	if (snd_config_search(conf, "range", &n) < 0)
 		return 0;
 	if (get_comment_range(n, SND_CTL_ELEM_TYPE_INTEGER,
 			      &omin, &omax, &ostep) < 0)
@@ -1011,13 +1078,11 @@ static int check_comment_range(snd_ctl_t *handle, snd_config_t *conf,
 	if (omin >= omax || nmin >= nmax)
 		return 0; /* invalid values */
 
-	n = search_comment_item(conf, "dbmin");
-	if (!n)
+	if (snd_config_search(conf, "dbmin", &n) < 0)
 		return 0;
 	if (config_integer(n, &odbmin, doit) < 0)
 		return 0;
-	n = search_comment_item(conf, "dbmax");
-	if (!n)
+	if (snd_config_search(conf, "dbmax", &n) < 0)
 		return 0;
 	if (config_integer(n, &odbmax, doit) < 0)
 		return 0;
@@ -1038,12 +1103,17 @@ static int check_comment_range(snd_ctl_t *handle, snd_config_t *conf,
 		snd_config_iterator_t i, next;
 		snd_config_for_each(i, next, value) {
 			snd_config_t *n = snd_config_iterator_entry(i);
+			const char *idxstr;
+			if (snd_config_get_id(n, &idxstr) < 0)
+				continue;
 			convert_to_new_db(n, omin, omax, nmin, nmax,
-					  odbmin, odbmax, ndbmin, ndbmax, doit);
+					  odbmin, odbmax, conf, idxstr,
+					  handle, id, doit);
 		}
 	} else
 		convert_to_new_db(value, omin, omax, nmin, nmax,
-				  odbmin, odbmax, ndbmin, ndbmax, doit);
+				  odbmin, odbmax, conf, "0",
+				  handle, id, doit);
 	return 0;
 }
 
@@ -1242,7 +1312,7 @@ static int set_control(snd_ctl_t *handle, snd_config_t *control,
 		snd_ctl_elem_info_set_name(info, name);
 		snd_ctl_elem_info_set_index(info, index);
 		err = snd_ctl_elem_info(handle, info);
-		if (err < 0 && comment && is_user_control(comment)) {
+		if (err < 0 && comment && check_comment_access(comment, "user")) {
 			err = add_user_control(handle, info, comment);
 			if (err < 0) {
 				cerror(doit, "failed to add user control #%d (%s)",
@@ -1291,6 +1361,9 @@ static int set_control(snd_ctl_t *handle, snd_config_t *control,
 				return -EINVAL;
 			}
 		}
+		/* inactive controls are not restored */
+		if (comment && check_comment_access(comment, "inactive"))
+			return 0;
 	}
 
 	if (snd_ctl_elem_info_is_inactive(info) ||
@@ -1470,6 +1543,8 @@ int save_state(const char *file, const char *cardname)
 	snd_input_t *in;
 	snd_output_t *out;
 	int stdio;
+	char *nfile = NULL;
+	int lock_fd = -EINVAL;
 
 	err = snd_config_top(&config);
 	if (err < 0) {
@@ -1477,13 +1552,28 @@ int save_state(const char *file, const char *cardname)
 		return err;
 	}
 	stdio = !strcmp(file, "-");
+	if (!stdio) {
+		nfile = malloc(strlen(file) + 5);
+		if (nfile == NULL) {
+			error("No enough memory...");
+			err = -ENOMEM;
+			goto out;
+		}
+		strcpy(nfile, file);
+		strcat(nfile, ".new");
+		lock_fd = state_lock(file, 10);
+		if (lock_fd < 0) {
+			err = lock_fd;
+			goto out;
+		}
+	}
 	if (!stdio && (err = snd_input_stdio_open(&in, file, "r")) >= 0) {
 		err = snd_config_load(config, in);
 		snd_input_close(in);
 #if 0
 		if (err < 0) {
 			error("snd_config_load error: %s", snd_strerror(err));
-			return err;
+			goto out;
 		}
 #endif
 	}
@@ -1499,17 +1589,19 @@ int save_state(const char *file, const char *cardname)
 			if (card < 0) {
 				if (first) {
 					if (ignore_nocards) {
-						return 0;
+						err = 0;
+						goto out;
 					} else {
 						error("No soundcards found...");
-						return -ENODEV;
+						err = -ENODEV;
+						goto out;
 					}
 				}
 				break;
 			}
 			first = 0;
 			if ((err = get_controls(card, config)))
-				return err;
+				goto out;
 		}
 	} else {
 		int cardno;
@@ -1517,26 +1609,40 @@ int save_state(const char *file, const char *cardname)
 		cardno = snd_card_get_index(cardname);
 		if (cardno < 0) {
 			error("Cannot find soundcard '%s'...", cardname);
-			return cardno;
+			err = cardno;
+			goto out;
 		}
 		if ((err = get_controls(cardno, config))) {
-			return err;
+			goto out;
 		}
 	}
 	
-	if (stdio)
+	if (stdio) {
 		err = snd_output_stdio_attach(&out, stdout, 0);
-	else
-		err = snd_output_stdio_open(&out, file, "w");
+	} else {
+		err = snd_output_stdio_open(&out, nfile, "w");
+	}
 	if (err < 0) {
 		error("Cannot open %s for writing: %s", file, snd_strerror(err));
-		return -errno;
+		err = -errno;
+		goto out;
 	}
 	err = snd_config_save(config, out);
 	snd_output_close(out);
-	if (err < 0)
+	if (err < 0) {
 		error("snd_config_save: %s", snd_strerror(err));
-	return 0;
+	} else if (nfile) {
+		err = rename(nfile, file);
+		if (err < 0)
+			error("rename failed: %s (%s)", strerror(-err), file);
+	}
+out:
+	if (!stdio && lock_fd >= 0)
+		state_unlock(lock_fd, file);
+	free(nfile);
+	snd_config_delete(config);
+	snd_config_update_free_global();
+	return err;
 }
 
 int load_state(const char *file, const char *initfile, const char *cardname,
@@ -1545,7 +1651,7 @@ int load_state(const char *file, const char *initfile, const char *cardname,
 	int err, finalerr = 0;
 	snd_config_t *config;
 	snd_input_t *in;
-	int stdio;
+	int stdio, lock_fd = -EINVAL;
 
 	err = snd_config_top(&config);
 	if (err < 0) {
@@ -1553,30 +1659,47 @@ int load_state(const char *file, const char *initfile, const char *cardname,
 		return err;
 	}
 	stdio = !strcmp(file, "-");
-	if (stdio)
+	if (stdio) {
 		err = snd_input_stdio_attach(&in, stdin, 0);
-	else
-		err = snd_input_stdio_open(&in, file, "r");
+	} else {
+		lock_fd = state_lock(file, 10);
+		err = lock_fd >= 0 ? snd_input_stdio_open(&in, file, "r") : lock_fd;
+	}
 	if (err >= 0) {
 		err = snd_config_load(config, in);
 		snd_input_close(in);
+		if (lock_fd >= 0)
+			state_unlock(lock_fd, file);
 		if (err < 0) {
 			error("snd_config_load error: %s", snd_strerror(err));
-			return err;
+			goto out;
 		}
 	} else {
 		int card, first = 1;
 		char cardname1[16];
 
+		if (lock_fd >= 0)
+		        state_unlock(lock_fd, file);
 		error("Cannot open %s for reading: %s", file, snd_strerror(err));
 		finalerr = err;
-		card = -1;
+		if (cardname) {
+			card = snd_card_get_index(cardname);
+			if (card < 0) {
+				error("Cannot find soundcard '%s'...", cardname);
+				err = -ENODEV;
+				goto out;
+			}
+			goto single;
+		} else {
+			card = -1;
+		}
 		/* find each installed soundcards */
-		while (1) {
+		while (!cardname) {
 			if (snd_card_next(&card) < 0)
 				break;
 			if (card < 0)
 				break;
+single:
 			first = 0;
 			if (!do_init)
 				break;
@@ -1590,7 +1713,8 @@ int load_state(const char *file, const char *initfile, const char *cardname,
 		}
 		if (first)
 			finalerr = 0;	/* no cards, no error code */
-		return finalerr;
+		err = finalerr;
+		goto out;
 	}
 
 	if (!cardname) {
@@ -1605,10 +1729,12 @@ int load_state(const char *file, const char *initfile, const char *cardname,
 			if (card < 0) {
 				if (first) {
 					if (ignore_nocards) {
-						return 0;
+						err = 0;
+						goto out;
 					} else {
 						error("No soundcards found...");
-						return -ENODEV;
+						err = -ENODEV;
+						goto out;
 					}
 				}
 				break;
@@ -1635,7 +1761,8 @@ int load_state(const char *file, const char *initfile, const char *cardname,
 		cardno = snd_card_get_index(cardname);
 		if (cardno < 0) {
 			error("Cannot find soundcard '%s'...", cardname);
-			return -ENODEV;
+			err = -ENODEV;
+			goto out;
 		}
 		/* do a check if controls matches state file */
 		if (do_init && set_controls(cardno, config, 0)) {
@@ -1648,8 +1775,12 @@ int load_state(const char *file, const char *initfile, const char *cardname,
 		if ((err = set_controls(cardno, config, 1))) {
 			initfailed(cardno, "restore", err);
 			if (!force_restore)
-				return err;
+				goto out;
 		}
 	}
-	return finalerr;
+	err = finalerr;
+out:
+	snd_config_delete(config);
+	snd_config_update_free_global();
+	return err;
 }

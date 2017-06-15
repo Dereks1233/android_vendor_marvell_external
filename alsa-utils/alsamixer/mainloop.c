@@ -29,6 +29,7 @@
 #include "widget.h"
 #include "mixer_widget.h"
 #include "mixer_display.h"
+#include "mixer_controls.h"
 #include "mainloop.h"
 
 static WINDOW *curses_initialized;
@@ -52,7 +53,7 @@ void initialize_curses(bool use_color)
 	snd_lib_error_set_handler(black_hole_error_handler);
 }
 
-void shutdown(void)
+void app_shutdown(void)
 {
 	if (curses_initialized) {
 		clear();
@@ -128,8 +129,15 @@ void mainloop(void)
 		}
 		if (!active_widget)
 			break;
-		if (controls_changed)
+		if (controls_changed) {
+			controls_changed = FALSE;
+			create_controls();
+			control_values_changed = FALSE;
 			display_controls();
+		} else if (control_values_changed) {
+			control_values_changed = FALSE;
+			display_controls();
+		}
 	}
 	free(pollfds);
 }

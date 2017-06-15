@@ -25,9 +25,11 @@
 #include <stdarg.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
 #include <getopt.h>
 #include <errno.h>
 #include <signal.h>
+#include <sys/timerfd.h>
 #include <sys/types.h>
 #include <sys/poll.h>
 #include <sys/stat.h>
@@ -36,6 +38,8 @@
 #include <alsa/asoundlib.h>
 #include "aconfig.h"
 #include "version.h"
+
+#define NSEC_PER_SEC 1000000000L
 
 static int do_device_list, do_rawmidi_list;
 static char *port_name = "default";
@@ -46,8 +50,9 @@ static char *send_data;
 static int send_data_length;
 static int receive_file;
 static int dump;
-static int timeout;
+static float timeout;
 static int stop;
+static int sysex_interval;
 static snd_rawmidi_t *input, **inputp;
 static snd_rawmidi_t *output, **outputp;
 
@@ -66,18 +71,20 @@ static void usage(void)
 	printf(
 		"Usage: amidi options\n"
 		"\n"
-		"-h, --help             this help\n"
-		"-V, --version          print current version\n"
-		"-l, --list-devices     list all hardware ports\n"
-		"-L, --list-rawmidis    list all RawMIDI definitions\n"
-		"-p, --port=name        select port by name\n"
-		"-s, --send=file        send the contents of a (.syx) file\n"
-		"-r, --receive=file     write received data into a file\n"
-		"-S, --send-hex=\"...\"   send hexadecimal bytes\n"
-		"-d, --dump             print received data as hexadecimal bytes\n"
-		"-t, --timeout=seconds  exits when no data has been received\n"
-		"                       for the specified duration\n"
-		"-a, --active-sensing   don't ignore active sensing bytes\n");
+		"-h, --help                      this help\n"
+		"-V, --version                   print current version\n"
+		"-l, --list-devices              list all hardware ports\n"
+		"-L, --list-rawmidis             list all RawMIDI definitions\n"
+		"-p, --port=name                 select port by name\n"
+		"-s, --send=file                 send the contents of a (.syx) file\n"
+		"-r, --receive=file              write received data into a file\n"
+		"-S, --send-hex=\"...\"            send hexadecimal bytes\n"
+		"-d, --dump                      print received data as hexadecimal bytes\n"
+		"-t, --timeout=seconds           exits when no data has been received\n"
+		"                                for the specified duration\n"
+		"-a, --active-sensing            include active sensing bytes\n"
+		"-c, --clock                     include clock bytes\n"
+		"-i, --sysex-interval=mseconds   delay in between each SysEx message\n");
 }
 
 static void version(void)
@@ -223,6 +230,47 @@ static void rawmidi_list(void)
 		snd_config_save(config, output);
 	}
 	snd_output_close(output);
+}
+
+static int send_midi_interleaved(void)
+{
+	int err;
+	char *data = send_data;
+	size_t buffer_size;
+	snd_rawmidi_params_t *param;
+	snd_rawmidi_status_t *st;
+
+	snd_rawmidi_status_alloca(&st);
+
+	snd_rawmidi_params_alloca(&param);
+	snd_rawmidi_params_current(output, param);
+	buffer_size = snd_rawmidi_params_get_buffer_size(param);
+
+	while (data < (send_data + send_data_length)) {
+		int len = send_data + send_data_length - data;
+		char *temp;
+
+		if (data > send_data) {
+			snd_rawmidi_status(output, st);
+			do {
+				/* 320 µs per byte as noted in Page 1 of MIDI spec */
+				usleep((buffer_size - snd_rawmidi_status_get_avail(st)) * 320);
+				snd_rawmidi_status(output, st);
+			} while(snd_rawmidi_status_get_avail(st) < buffer_size);
+			usleep(sysex_interval * 1000);
+		}
+
+		/* find end of SysEx */
+		if ((temp = memchr(data, 0xf7, len)) != NULL)
+			len = temp - data + 1;
+
+		if ((err = snd_rawmidi_write(output, data, len)) < 0)
+			return err;
+
+		data += len;
+	}
+
+	return 0;
 }
 
 static void load_file(void)
@@ -406,7 +454,7 @@ static void add_send_hex_data(const char *str)
 
 int main(int argc, char *argv[])
 {
-	static const char short_options[] = "hVlLp:s:r:S::dt:a";
+	static const char short_options[] = "hVlLp:s:r:S::dt:aci:";
 	static const struct option long_options[] = {
 		{"help", 0, NULL, 'h'},
 		{"version", 0, NULL, 'V'},
@@ -419,11 +467,15 @@ int main(int argc, char *argv[])
 		{"dump", 0, NULL, 'd'},
 		{"timeout", 1, NULL, 't'},
 		{"active-sensing", 0, NULL, 'a'},
+		{"clock", 0, NULL, 'c'},
+		{"sysex-interval", 1, NULL, 'i'},
 		{ }
 	};
 	int c, err, ok = 0;
 	int ignore_active_sensing = 1;
+	int ignore_clock = 1;
 	int do_send_hex = 0;
+	struct itimerspec itimerspec = { .it_interval = { 0, 0 } };
 
 	while ((c = getopt_long(argc, argv, short_options,
 		     		long_options, NULL)) != -1) {
@@ -458,10 +510,17 @@ int main(int argc, char *argv[])
 			dump = 1;
 			break;
 		case 't':
-			timeout = atoi(optarg);
+			if (optarg)
+				timeout = atof(optarg);
 			break;
 		case 'a':
 			ignore_active_sensing = 0;
+			break;
+		case 'c':
+			ignore_clock = 0;
+			break;
+		case 'i':
+			sysex_interval = atoi(optarg);
 			break;
 		default:
 			error("Try `amidi --help' for more information.");
@@ -538,48 +597,79 @@ int main(int argc, char *argv[])
 			error("cannot set blocking mode: %s", snd_strerror(err));
 			goto _exit;
 		}
-		if ((err = snd_rawmidi_write(output, send_data, send_data_length)) < 0) {
-			error("cannot send data: %s", snd_strerror(err));
-			goto _exit;
+		if (!sysex_interval) {
+			if ((err = snd_rawmidi_write(output, send_data, send_data_length)) < 0) {
+				error("cannot send data: %s", snd_strerror(err));
+				return err;
+			}
+		} else {
+			if ((err = send_midi_interleaved()) < 0) {
+				error("cannot send data: %s", snd_strerror(err));
+				return err;
+			}
 		}
 	}
 
 	if (inputp) {
 		int read = 0;
-		int npfds, time = 0;
+		int npfds;
 		struct pollfd *pfds;
 
-		timeout *= 1000;
-		npfds = snd_rawmidi_poll_descriptors_count(input);
+		npfds = 1 + snd_rawmidi_poll_descriptors_count(input);
 		pfds = alloca(npfds * sizeof(struct pollfd));
-		snd_rawmidi_poll_descriptors(input, pfds, npfds);
+
+		if (timeout > 0) {
+			pfds[0].fd = timerfd_create(CLOCK_MONOTONIC, 0);
+			if (pfds[0].fd == -1) {
+				error("cannot create timer: %s", strerror(errno));
+				goto _exit;
+			}
+			pfds[0].events = POLLIN;
+		} else {
+			pfds[0].fd = -1;
+		}
+
+		snd_rawmidi_poll_descriptors(input, &pfds[1], npfds - 1);
+
 		signal(SIGINT, sig_handler);
+
+		if (timeout > 0) {
+			float timeout_int;
+
+			itimerspec.it_value.tv_nsec = modff(timeout, &timeout_int) * NSEC_PER_SEC;
+			itimerspec.it_value.tv_sec = timeout_int;
+			err = timerfd_settime(pfds[0].fd, 0, &itimerspec, NULL);
+			if (err < 0) {
+				error("cannot set timer: %s", strerror(errno));
+				goto _exit;
+			}
+		}
 		for (;;) {
 			unsigned char buf[256];
 			int i, length;
 			unsigned short revents;
 
-			err = poll(pfds, npfds, 200);
+			err = poll(pfds, npfds, -1);
 			if (stop || (err < 0 && errno == EINTR))
 				break;
 			if (err < 0) {
 				error("poll failed: %s", strerror(errno));
 				break;
 			}
-			if (err == 0) {
-				time += 200;
-				if (timeout && time >= timeout)
-					break;
-				continue;
-			}
-			if ((err = snd_rawmidi_poll_descriptors_revents(input, pfds, npfds, &revents)) < 0) {
+
+			err = snd_rawmidi_poll_descriptors_revents(input, &pfds[1], npfds - 1, &revents);
+			if (err < 0) {
 				error("cannot get poll events: %s", snd_strerror(errno));
 				break;
 			}
 			if (revents & (POLLERR | POLLHUP))
 				break;
-			if (!(revents & POLLIN))
+			if (!(revents & POLLIN)) {
+				if (pfds[0].revents & POLLIN)
+					break;
 				continue;
+			}
+
 			err = snd_rawmidi_read(input, buf, sizeof(buf));
 			if (err == -EAGAIN)
 				continue;
@@ -589,18 +679,29 @@ int main(int argc, char *argv[])
 			}
 			length = 0;
 			for (i = 0; i < err; ++i)
-				if (!ignore_active_sensing || buf[i] != 0xfe)
+				if ((buf[i] != MIDI_CMD_COMMON_CLOCK &&
+				     buf[i] != MIDI_CMD_COMMON_SENSING) ||
+				    (buf[i] == MIDI_CMD_COMMON_CLOCK   && !ignore_clock) ||
+				    (buf[i] == MIDI_CMD_COMMON_SENSING && !ignore_active_sensing))
 					buf[length++] = buf[i];
 			if (length == 0)
 				continue;
 			read += length;
-			time = 0;
+
 			if (receive_file != -1)
 				write(receive_file, buf, length);
 			if (dump) {
 				for (i = 0; i < length; ++i)
 					print_byte(buf[i]);
 				fflush(stdout);
+			}
+
+			if (timeout > 0) {
+				err = timerfd_settime(pfds[0].fd, 0, &itimerspec, NULL);
+				if (err < 0) {
+					error("cannot set timer: %s", strerror(errno));
+					break;
+				}
 			}
 		}
 		if (isatty(fileno(stdout)))

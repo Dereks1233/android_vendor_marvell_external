@@ -1,6 +1,6 @@
 /*
  * alsamixer - curses mixer for the ALSA project
- * Copyright (c) 1998,1999 Tim Janik <timj@gtk.org>
+ * Copyright (c) 1998,1999 Tim Janik
  *                         Jaroslav Kysela <perex@perex.cz>
  * Copyright (c) 2009      Clemens Ladisch <clemens@ladisch.de>
  *
@@ -115,6 +115,9 @@ fail:
 
 int main(int argc, char *argv[])
 {
+	if (!isatty(fileno(stdin)))
+		return 0;
+
 	setlocale(LC_ALL, "");
 #ifdef ENABLE_NLS_IN_CURSES
 	textdomain(PACKAGE);
@@ -130,6 +133,6 @@ int main(int argc, char *argv[])
 
 	mainloop();
 
-	shutdown();
+	app_shutdown();
 	return 0;
 }
