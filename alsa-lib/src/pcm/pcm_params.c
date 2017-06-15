@@ -1081,7 +1081,6 @@ int snd_pcm_hw_param_never_eq(const snd_pcm_hw_params_t *params,
 static int snd_pcm_hw_params_choose(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
 {
 	int err;
-	const char *compat = getenv("LIBASOUND_COMPAT");
 #ifdef CHOOSE_DEBUG
 	snd_output_t *log;
 	snd_output_stdio_attach(&log, stderr, 0);
@@ -1104,7 +1103,19 @@ static int snd_pcm_hw_params_choose(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
 	err = snd_pcm_hw_param_set_first(pcm, params, SND_PCM_HW_PARAM_RATE, NULL, 0);
 	if (err < 0)
 		return err;
-	if (compat && *compat) {
+	if (pcm->minperiodtime > 0) {
+		unsigned int min, max;
+		int dir = 1;
+		err = snd_pcm_hw_param_get_min(params, SND_PCM_HW_PARAM_PERIOD_TIME, &min, &dir);
+		if (err >= 0)
+			err = snd_pcm_hw_param_get_max(params, SND_PCM_HW_PARAM_PERIOD_TIME, &max, &dir);
+		if (err >= 0 && (long)min < pcm->minperiodtime &&
+			        (long)max > pcm->minperiodtime) {
+			min = pcm->minperiodtime; dir = 1;
+			snd_pcm_hw_param_set_min(pcm, params, SND_CHANGE, SND_PCM_HW_PARAM_PERIOD_TIME, &min, &dir);
+		}
+	}
+	if (pcm->compat) {
 		/* old mode */
 		err = snd_pcm_hw_param_set_first(pcm, params, SND_PCM_HW_PARAM_PERIOD_TIME, NULL, 0);
 		if (err < 0)
@@ -2115,6 +2126,7 @@ int _snd_pcm_hw_params_refine(snd_pcm_hw_params_t *params,
 			err = changed;
 	}
 	params->info &= src->info;
+	params->flags = src->flags; /* propagate all flags to slave */
 	return err;
 }
 
@@ -2232,9 +2244,11 @@ int snd_pcm_hw_params_slave(snd_pcm_t *pcm, snd_pcm_hw_params_t *params,
 	snd_pcm_hw_params_t slave_params;
 	int err;
 	err = sprepare(pcm, &slave_params);
-	assert(err >= 0);
+	if (err < 0)
+		return err;
 	err = schange(pcm, params, &slave_params);
-	assert(err >= 0);
+	if (err < 0)
+		return err;
 	err = sparams(pcm, &slave_params);
 	if (err < 0)
 		cchange(pcm, params, &slave_params);
@@ -2245,7 +2259,9 @@ static int snd_pcm_sw_params_default(snd_pcm_t *pcm, snd_pcm_sw_params_t *params
 {
 	assert(pcm && params);
 	assert(pcm->setup);
+	params->proto = SNDRV_PCM_VERSION;
 	params->tstamp_mode = SND_PCM_TSTAMP_NONE;
+	params->tstamp_type = pcm->tstamp_type;
 	params->period_step = 1;
 	params->sleep_min = 0;
 	params->avail_min = pcm->period_size;
@@ -2297,7 +2313,7 @@ int snd_pcm_hw_refine(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
    max periods
    Return 0 on success otherwise a negative error code
 */
-int _snd_pcm_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
+int _snd_pcm_hw_params_internal(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
 {
 	int err;
 	snd_pcm_sw_params_t sw;
@@ -2345,7 +2361,8 @@ int _snd_pcm_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
 	memset(&sw, 0, sizeof(sw));
 	snd_pcm_sw_params_default(pcm, &sw);
 	err = snd_pcm_sw_params(pcm, &sw);
-	assert(err >= 0);
+	if (err < 0)
+		return err;
 
 	if (pcm->mmap_rw || 
 	    pcm->access == SND_PCM_ACCESS_MMAP_INTERLEAVED ||

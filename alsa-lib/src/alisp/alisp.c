@@ -989,7 +989,7 @@ static void dump_objects(struct alisp_instance *instance, const char *fname)
 	else
 		err = snd_output_stdio_open(&out, fname, "w+");
 	if (err < 0) {
-		SNDERR("alisp: cannot open file '%s' for writting (%s)", fname, snd_strerror(errno));
+		SNDERR("alisp: cannot open file '%s' for writing (%s)", fname, snd_strerror(errno));
 		return;
 	}
 
@@ -1025,7 +1025,6 @@ static const char *obj_type_str(struct alisp_object * p)
 	case ALISP_OBJ_CONS: return "cons";
 	default: assert(0);
 	}
-	return 0; /* make compiler happy */
 }
 
 static void print_obj_lists(struct alisp_instance *instance, snd_output_t *out)
@@ -1063,7 +1062,7 @@ static void dump_obj_lists(struct alisp_instance *instance, const char *fname)
 	else
 		err = snd_output_stdio_open(&out, fname, "w+");
 	if (err < 0) {
-		SNDERR("alisp: cannot open file '%s' for writting (%s)", fname, snd_strerror(errno));
+		SNDERR("alisp: cannot open file '%s' for writing (%s)", fname, snd_strerror(errno));
 		return;
 	}
 
@@ -2400,7 +2399,7 @@ struct alisp_object * F_path(struct alisp_instance *instance, struct alisp_objec
 	}
 	if (!strcmp(p1->value.s, "data")) {
 		delete_tree(instance, p1);
-		return new_string(instance, ALSA_CONFIG_DIR);
+		return new_string(instance, snd_config_topdir());
 	}
 	delete_tree(instance, p1);
 	return &alsa_lisp_nil;
@@ -3203,12 +3202,11 @@ int alsa_lisp(struct alisp_cfg *cfg, struct alisp_instance **_instance)
 	struct alisp_object *p, *p1;
 	int i, j, retval = 0;
 	
-	instance = (struct alisp_instance *)malloc(sizeof(struct alisp_instance));
+	instance = (struct alisp_instance *)calloc(1, sizeof(struct alisp_instance));
 	if (instance == NULL) {
 		nomem();
 		return -ENOMEM;
 	}
-	memset(instance, 0, sizeof(struct alisp_instance));
 	instance->verbose = cfg->verbose && cfg->vout;
 	instance->warning = cfg->warning && cfg->wout;
 	instance->debug = cfg->debug && cfg->dout;
@@ -3257,7 +3255,7 @@ int alsa_lisp(struct alisp_cfg *cfg, struct alisp_instance **_instance)
 	else
 		alsa_lisp_free(instance); 
 	
-	return 0;
+	return retval;
 }
 
 void alsa_lisp_free(struct alisp_instance *instance)

@@ -54,6 +54,23 @@ const char *_snd_module_pcm_dsnoop = "";
  *
  */
 
+static int snoop_timestamp(snd_pcm_t *pcm)
+{
+	snd_pcm_direct_t *dsnoop = pcm->private_data;
+	snd_pcm_uframes_t ptr1 = -2LL /* invalid value */, ptr2;
+
+	/* loop is required to sync hw.ptr with timestamp */
+	while (1) {
+		ptr2 = *dsnoop->spcm->hw.ptr;
+		if (ptr1 == ptr2)
+			break;
+		ptr1 = ptr2;
+		dsnoop->update_tstamp = snd_pcm_hw_fast_tstamp(dsnoop->spcm);
+	}
+	dsnoop->slave_hw_ptr = ptr1;
+	return 0;
+}
+
 static void snoop_areas(snd_pcm_direct_t *dsnoop,
 			const snd_pcm_channel_area_t *src_areas,
 			const snd_pcm_channel_area_t *dst_areas,
@@ -115,18 +132,26 @@ static int snd_pcm_dsnoop_sync_ptr(snd_pcm_t *pcm)
 	snd_pcm_direct_t *dsnoop = pcm->private_data;
 	snd_pcm_uframes_t slave_hw_ptr, old_slave_hw_ptr, avail;
 	snd_pcm_sframes_t diff;
-	
+	int err;
+
 	switch (snd_pcm_state(dsnoop->spcm)) {
 	case SND_PCM_STATE_DISCONNECTED:
 		dsnoop->state = SNDRV_PCM_STATE_DISCONNECTED;
 		return -ENODEV;
+	case SND_PCM_STATE_XRUN:
+		if ((err = snd_pcm_direct_slave_recover(dsnoop)) < 0)
+			return err;
+		break;
 	default:
 		break;
 	}
+	if (snd_pcm_direct_client_chk_xrun(dsnoop, pcm))
+		return -EPIPE;
 	if (dsnoop->slowptr)
 		snd_pcm_hwsync(dsnoop->spcm);
 	old_slave_hw_ptr = dsnoop->slave_hw_ptr;
-	slave_hw_ptr = dsnoop->slave_hw_ptr = *dsnoop->spcm->hw.ptr;
+	snoop_timestamp(pcm);
+	slave_hw_ptr = dsnoop->slave_hw_ptr;
 	diff = slave_hw_ptr - old_slave_hw_ptr;
 	if (diff == 0)		/* fast path */
 		return 0;
@@ -141,7 +166,7 @@ static int snd_pcm_dsnoop_sync_ptr(snd_pcm_t *pcm)
 	if (pcm->stop_threshold >= pcm->boundary)	/* don't care */
 		return 0;
 	if ((avail = snd_pcm_mmap_capture_hw_avail(pcm)) >= pcm->stop_threshold) {
-		gettimestamp(&dsnoop->trigger_tstamp, pcm->monotonic);
+		gettimestamp(&dsnoop->trigger_tstamp, pcm->tstamp_type);
 		dsnoop->state = SND_PCM_STATE_XRUN;
 		dsnoop->avail_max = avail;
 		return -EPIPE;
@@ -169,28 +194,36 @@ static int snd_pcm_dsnoop_status(snd_pcm_t *pcm, snd_pcm_status_t * status)
 		break;
 	}
 	memset(status, 0, sizeof(*status));
+	snd_pcm_status(dsnoop->spcm, status);
 	state = snd_pcm_state(dsnoop->spcm);
 	status->state = state == SND_PCM_STATE_RUNNING ? dsnoop->state : state;
 	status->trigger_tstamp = dsnoop->trigger_tstamp;
-	gettimestamp(&status->tstamp, pcm->monotonic);
 	status->avail = snd_pcm_mmap_capture_avail(pcm);
 	status->avail_max = status->avail > dsnoop->avail_max ? status->avail : dsnoop->avail_max;
 	dsnoop->avail_max = 0;
+	status->delay = snd_pcm_mmap_capture_delay(pcm);
 	return 0;
 }
 
 static snd_pcm_state_t snd_pcm_dsnoop_state(snd_pcm_t *pcm)
 {
 	snd_pcm_direct_t *dsnoop = pcm->private_data;
-	switch (snd_pcm_state(dsnoop->spcm)) {
+	int err;
+	snd_pcm_state_t state;
+	state = snd_pcm_state(dsnoop->spcm);
+	switch (state) {
 	case SND_PCM_STATE_SUSPENDED:
-		return SND_PCM_STATE_SUSPENDED;
 	case SND_PCM_STATE_DISCONNECTED:
-		dsnoop->state = SNDRV_PCM_STATE_DISCONNECTED;
-		return -ENODEV;
+		dsnoop->state = state;
+		return state;
+	case SND_PCM_STATE_XRUN:
+		if ((err = snd_pcm_direct_slave_recover(dsnoop)) < 0)
+			return err;
+		break;
 	default:
 		break;
 	}
+	snd_pcm_direct_client_chk_xrun(dsnoop, pcm);
 	return dsnoop->state;
 }
 
@@ -205,6 +238,7 @@ static int snd_pcm_dsnoop_delay(snd_pcm_t *pcm, snd_pcm_sframes_t *delayp)
 		err = snd_pcm_dsnoop_sync_ptr(pcm);
 		if (err < 0)
 			return err;
+		/* Fall through */
 	case SNDRV_PCM_STATE_PREPARED:
 	case SNDRV_PCM_STATE_SUSPENDED:
 		*delayp = snd_pcm_mmap_capture_hw_avail(pcm);
@@ -238,23 +272,12 @@ static int snd_pcm_dsnoop_hwsync(snd_pcm_t *pcm)
 	}
 }
 
-static int snd_pcm_dsnoop_prepare(snd_pcm_t *pcm)
-{
-	snd_pcm_direct_t *dsnoop = pcm->private_data;
-
-	snd_pcm_direct_check_interleave(dsnoop, pcm);
-	dsnoop->state = SND_PCM_STATE_PREPARED;
-	dsnoop->appl_ptr = 0;
-	dsnoop->hw_ptr = 0;
-	return snd_pcm_direct_set_timer_params(dsnoop);
-}
-
 static int snd_pcm_dsnoop_reset(snd_pcm_t *pcm)
 {
 	snd_pcm_direct_t *dsnoop = pcm->private_data;
 	dsnoop->hw_ptr %= pcm->period_size;
 	dsnoop->appl_ptr = dsnoop->hw_ptr;
-	dsnoop->slave_appl_ptr = dsnoop->slave_hw_ptr = *dsnoop->spcm->hw.ptr;
+	dsnoop->slave_appl_ptr = dsnoop->slave_hw_ptr;
 	return 0;
 }
 
@@ -266,12 +289,13 @@ static int snd_pcm_dsnoop_start(snd_pcm_t *pcm)
 	if (dsnoop->state != SND_PCM_STATE_PREPARED)
 		return -EBADFD;
 	snd_pcm_hwsync(dsnoop->spcm);
-	dsnoop->slave_appl_ptr = dsnoop->slave_hw_ptr = *dsnoop->spcm->hw.ptr;
+	snoop_timestamp(pcm);
+	dsnoop->slave_appl_ptr = dsnoop->slave_hw_ptr;
 	err = snd_timer_start(dsnoop->timer);
 	if (err < 0)
 		return err;
 	dsnoop->state = SND_PCM_STATE_RUNNING;
-	gettimestamp(&dsnoop->trigger_tstamp, pcm->monotonic);
+	dsnoop->trigger_tstamp = dsnoop->update_tstamp;
 	return 0;
 }
 
@@ -285,7 +309,8 @@ static int snd_pcm_dsnoop_drop(snd_pcm_t *pcm)
 	return 0;
 }
 
-static int snd_pcm_dsnoop_drain(snd_pcm_t *pcm)
+/* locked version */
+static int __snd_pcm_dsnoop_drain(snd_pcm_t *pcm)
 {
 	snd_pcm_direct_t *dsnoop = pcm->private_data;
 	snd_pcm_uframes_t stop_threshold;
@@ -302,10 +327,20 @@ static int snd_pcm_dsnoop_drain(snd_pcm_t *pcm)
 			break;
 		if (pcm->mode & SND_PCM_NONBLOCK)
 			return -EAGAIN;
-		snd_pcm_wait(pcm, -1);
+		__snd_pcm_wait_in_lock(pcm, -1);
 	}
 	pcm->stop_threshold = stop_threshold;
 	return snd_pcm_dsnoop_drop(pcm);
+}
+
+static int snd_pcm_dsnoop_drain(snd_pcm_t *pcm)
+{
+	int err;
+
+	snd_pcm_lock(pcm);
+	err = __snd_pcm_dsnoop_drain(pcm);
+	snd_pcm_unlock(pcm);
+	return err;
 }
 
 static int snd_pcm_dsnoop_pause(snd_pcm_t *pcm ATTRIBUTE_UNUSED, int enable ATTRIBUTE_UNUSED)
@@ -315,16 +350,14 @@ static int snd_pcm_dsnoop_pause(snd_pcm_t *pcm ATTRIBUTE_UNUSED, int enable ATTR
 
 static snd_pcm_sframes_t snd_pcm_dsnoop_rewindable(snd_pcm_t *pcm)
 {
-	return snd_pcm_mmap_capture_avail(pcm);
+	return snd_pcm_mmap_capture_hw_avail(pcm);
 }
 
 static snd_pcm_sframes_t snd_pcm_dsnoop_rewind(snd_pcm_t *pcm, snd_pcm_uframes_t frames)
 {
 	snd_pcm_sframes_t avail;
 
-	avail = snd_pcm_mmap_capture_avail(pcm);
-	if (avail < 0)
-		return 0;
+	avail = snd_pcm_dsnoop_rewindable(pcm);
 	if (frames > (snd_pcm_uframes_t)avail)
 		frames = avail;
 	snd_pcm_mmap_appl_backward(pcm, frames);
@@ -333,16 +366,14 @@ static snd_pcm_sframes_t snd_pcm_dsnoop_rewind(snd_pcm_t *pcm, snd_pcm_uframes_t
 
 static snd_pcm_sframes_t snd_pcm_dsnoop_forwardable(snd_pcm_t *pcm)
 {
-	return snd_pcm_mmap_capture_hw_avail(pcm);
+	return snd_pcm_mmap_capture_avail(pcm);
 }
 
 static snd_pcm_sframes_t snd_pcm_dsnoop_forward(snd_pcm_t *pcm, snd_pcm_uframes_t frames)
 {
 	snd_pcm_sframes_t avail;
 
-	avail = snd_pcm_mmap_capture_hw_avail(pcm);
-	if (avail < 0)
-		return 0;
+	avail = snd_pcm_dsnoop_forwardable(pcm);
 	if (frames > (snd_pcm_uframes_t)avail)
 		frames = avail;
 	snd_pcm_mmap_appl_forward(pcm, frames);
@@ -371,10 +402,11 @@ static int snd_pcm_dsnoop_close(snd_pcm_t *pcm)
  		snd_pcm_direct_server_discard(dsnoop);
  	if (dsnoop->client)
  		snd_pcm_direct_client_discard(dsnoop);
-	if (snd_pcm_direct_shm_discard(dsnoop))
-		snd_pcm_direct_semaphore_discard(dsnoop);
-	else
-		snd_pcm_direct_semaphore_up(dsnoop, DIRECT_IPC_SEM_CLIENT);
+	if (snd_pcm_direct_shm_discard(dsnoop)) {
+		if (snd_pcm_direct_semaphore_discard(dsnoop))
+			snd_pcm_direct_semaphore_final(dsnoop, DIRECT_IPC_SEM_CLIENT);
+	} else
+		snd_pcm_direct_semaphore_final(dsnoop, DIRECT_IPC_SEM_CLIENT);
 	free(dsnoop->bindings);
 	pcm->private_data = NULL;
 	free(dsnoop);
@@ -390,12 +422,16 @@ static snd_pcm_sframes_t snd_pcm_dsnoop_mmap_commit(snd_pcm_t *pcm,
 
 	switch (snd_pcm_state(dsnoop->spcm)) {
 	case SND_PCM_STATE_XRUN:
-		return -EPIPE;
+		if ((err = snd_pcm_direct_slave_recover(dsnoop)) < 0)
+			return err;
+		break;
 	case SND_PCM_STATE_SUSPENDED:
 		return -ESTRPIPE;
 	default:
 		break;
 	}
+	if (snd_pcm_direct_client_chk_xrun(dsnoop, pcm))
+		return -EPIPE;
 	if (dsnoop->state == SND_PCM_STATE_RUNNING) {
 		err = snd_pcm_dsnoop_sync_ptr(pcm);
 		if (err < 0)
@@ -418,6 +454,9 @@ static snd_pcm_sframes_t snd_pcm_dsnoop_avail_update(snd_pcm_t *pcm)
 		if (err < 0)
 			return err;
 	}
+	if (dsnoop->state == SND_PCM_STATE_XRUN)
+		return -EPIPE;
+
 	return snd_pcm_mmap_capture_avail(pcm);
 }
 
@@ -437,7 +476,8 @@ static int snd_pcm_dsnoop_htimestamp(snd_pcm_t *pcm,
 		if (ok && *avail == avail1)
 			break;
 		*avail = avail1;
-		*tstamp = snd_pcm_hw_fast_tstamp(pcm);
+		*tstamp = snd_pcm_hw_fast_tstamp(dsnoop->spcm);
+		ok = 1;
 	}
 	return 0;
 }
@@ -468,6 +508,9 @@ static const snd_pcm_ops_t snd_pcm_dsnoop_ops = {
 	.async = snd_pcm_direct_async,
 	.mmap = snd_pcm_direct_mmap,
 	.munmap = snd_pcm_direct_munmap,
+	.query_chmaps = snd_pcm_direct_query_chmaps,
+	.get_chmap = snd_pcm_direct_get_chmap,
+	.set_chmap = snd_pcm_direct_set_chmap,
 };
 
 static const snd_pcm_fast_ops_t snd_pcm_dsnoop_fast_ops = {
@@ -475,7 +518,7 @@ static const snd_pcm_fast_ops_t snd_pcm_dsnoop_fast_ops = {
 	.state = snd_pcm_dsnoop_state,
 	.hwsync = snd_pcm_dsnoop_hwsync,
 	.delay = snd_pcm_dsnoop_delay,
-	.prepare = snd_pcm_dsnoop_prepare,
+	.prepare = snd_pcm_direct_prepare,
 	.reset = snd_pcm_dsnoop_reset,
 	.start = snd_pcm_dsnoop_start,
 	.drop = snd_pcm_dsnoop_drop,
@@ -496,7 +539,7 @@ static const snd_pcm_fast_ops_t snd_pcm_dsnoop_fast_ops = {
 	.avail_update = snd_pcm_dsnoop_avail_update,
 	.mmap_commit = snd_pcm_dsnoop_mmap_commit,
 	.htimestamp = snd_pcm_dsnoop_htimestamp,
-	.poll_descriptors = NULL,
+	.poll_descriptors = snd_pcm_direct_poll_descriptors,
 	.poll_descriptors_count = NULL,
 	.poll_revents = snd_pcm_direct_poll_revents,
 };
@@ -582,8 +625,10 @@ int snd_pcm_dsnoop_open(snd_pcm_t **pcmp, const char *name,
 	dsnoop->state = SND_PCM_STATE_OPEN;
 	dsnoop->slowptr = opts->slowptr;
 	dsnoop->max_periods = opts->max_periods;
+	dsnoop->var_periodsize = opts->var_periodsize;
 	dsnoop->sync_ptr = snd_pcm_dsnoop_sync_ptr;
 
+ retry:
 	if (first_instance) {
 		/* recursion is already checked in
 		   snd_pcm_direct_get_slave_ipc_offset() */
@@ -638,6 +683,13 @@ int snd_pcm_dsnoop_open(snd_pcm_t **pcmp, const char *name,
 						 SND_PCM_APPEND,
 						 NULL);
 			if (ret < 0) {
+				/* all other streams have been closed;
+				 * retry as the first instance
+				 */
+				if (ret == -EBADFD) {
+					first_instance = 1;
+					goto retry;
+				}
 				SNDERR("unable to open slave");
 				goto _err;
 			}
@@ -665,7 +717,7 @@ int snd_pcm_dsnoop_open(snd_pcm_t **pcmp, const char *name,
 
 	pcm->poll_fd = dsnoop->poll_fd;
 	pcm->poll_events = POLLIN;	/* it's different than other plugins */
-		
+	pcm->tstamp_type = spcm->tstamp_type;
 	pcm->mmap_rw = 1;
 	snd_pcm_set_hw_ptr(pcm, &dsnoop->hw_ptr, -1, 0);
 	snd_pcm_set_appl_ptr(pcm, &dsnoop->appl_ptr, -1, 0);
@@ -687,10 +739,12 @@ int snd_pcm_dsnoop_open(snd_pcm_t **pcmp, const char *name,
 		snd_pcm_direct_client_discard(dsnoop);
 	if (spcm)
 		snd_pcm_close(spcm);
-	if (dsnoop->shmid >= 0)
-		snd_pcm_direct_shm_discard(dsnoop);
-	if (snd_pcm_direct_semaphore_discard(dsnoop) < 0)
+	if ((dsnoop->shmid >= 0) && (snd_pcm_direct_shm_discard(dsnoop))) {
+		if (snd_pcm_direct_semaphore_discard(dsnoop))
+			snd_pcm_direct_semaphore_final(dsnoop, DIRECT_IPC_SEM_CLIENT);
+	} else
 		snd_pcm_direct_semaphore_up(dsnoop, DIRECT_IPC_SEM_CLIENT);
+
  _err_nosem:
 	if (dsnoop) {
 		free(dsnoop->bindings);

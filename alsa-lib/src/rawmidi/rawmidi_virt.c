@@ -263,8 +263,8 @@ static ssize_t snd_rawmidi_virtual_read(snd_rawmidi_t *rmidi, void *buffer, size
 		}
 		size1 = virt->in_buf_size - virt->in_buf_ofs;
 		if ((size_t)size1 > size) {
-			virt->in_buf_ofs += size1 - size;
-			memcpy(buffer, virt->in_buf_ptr, size);
+			memcpy(buffer, virt->in_buf_ptr + virt->in_buf_ofs, size);
+			virt->in_buf_ofs += size;
 			result += size;
 			break;
 		}
@@ -383,9 +383,11 @@ int snd_rawmidi_virtual_open(snd_rawmidi_t **inputp, snd_rawmidi_t **outputp,
  _err:
 	if (seq_handle)
 		snd_seq_close(seq_handle);
-	if (virt->midi_event)
-		snd_midi_event_free(virt->midi_event);
-	free(virt);
+	if (virt) {
+		if (virt->midi_event)
+			snd_midi_event_free(virt->midi_event);
+		free(virt);
+	}
 	if (inputp)
 		free(*inputp);
 	if (outputp)

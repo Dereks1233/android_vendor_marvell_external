@@ -38,12 +38,20 @@ if BUILD_SEQ
 SUBDIRS += seq
 libasound_la_LIBADD += seq/libseq.la
 endif
+if BUILD_UCM
+SUBDIRS += ucm
+libasound_la_LIBADD += ucm/libucm.la
+endif
+if BUILD_TOPOLOGY
+SUBDIRS += topology
+libasound_la_LIBADD += topology/libtopology.la
+endif
 if BUILD_ALISP
 SUBDIRS += alisp
 libasound_la_LIBADD += alisp/libalisp.la
 endif
-SUBDIRS += compat conf
-libasound_la_LIBADD += compat/libcompat.la @ALSA_DEPLIBS@
+SUBDIRS += conf
+libasound_la_LIBADD += @ALSA_DEPLIBS@
 
 libasound_la_LDFLAGS = -version-info $(COMPATNUM) $(VSYMS) $(SYMFUNCS) $(LDFLAGS_NOUNDEFINED)
 
@@ -74,13 +82,16 @@ hwdep/libhwdep.la:
 seq/libseq.la:
 	$(MAKE) -C seq libseq.la
 
+ucm/libucm.la:
+	$(MAKE) -C ucm libucm.la
+
+topology/libtopology.la:
+	$(MAKE) -C topology libtopology.la
+
 instr/libinstr.la:
 	$(MAKE) -C instr libinstr.la
-
-compat/libcompat.la:
-	$(MAKE) -C compat libcompat.la
 
 alisp/libalisp.la:
 	$(MAKE) -C alisp libalisp.la
 
-INCLUDES=-I$(top_srcdir)/include
+AM_CPPFLAGS=-I$(top_srcdir)/include

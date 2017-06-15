@@ -5,7 +5,7 @@ alsaincludedir = ${includedir}/alsa
 
 alsainclude_HEADERS = asoundlib.h asoundef.h \
 		      version.h global.h input.h output.h error.h \
-		      conf.h control.h iatomic.h
+		      conf.h control.h
 
 if BUILD_CTL_PLUGIN_EXT
 alsainclude_HEADERS += control_external.h
@@ -17,7 +17,7 @@ if BUILD_PCM_PLUGIN
 alsainclude_HEADERS += pcm_plugin.h
 endif
 if BUILD_PCM_PLUGIN_RATE
-alsainclude_HEADERS += pcm_rate.h 
+alsainclude_HEADERS += pcm_rate.h
 endif
 if BUILD_PCM_PLUGIN_EXTPLUG
 alsainclude_HEADERS += pcm_external.h pcm_extplug.h
@@ -46,12 +46,20 @@ if BUILD_SEQ
 alsainclude_HEADERS += seq_event.h seq.h seqmid.h seq_midi_event.h
 endif
 
+if BUILD_UCM
+alsainclude_HEADERS += use-case.h
+endif
+
+if BUILD_TOPOLOGY
+alsainclude_HEADERS += topology.h
+endif
+
 if BUILD_ALISP
 alsainclude_HEADERS += alisp.h
 endif
 
 noinst_HEADERS = alsa sys.h search.h list.h aserver.h local.h alsa-symbols.h \
-	asoundlib-head.h asoundlib-tail.h
+	asoundlib-head.h asoundlib-tail.h bswap.h type_compat.h
 
 DISTCLEANFILES = stamp-vh version.h alsa asoundlib.h
 
@@ -61,7 +69,7 @@ alsa:
 version.h: stamp-vh alsa
 	@:
 
-stamp-vh: $(top_builddir)/configure.in
+stamp-vh: $(top_builddir)/configure.ac
 	@echo "/*" > ver.tmp
 	@echo " *  version.h" >> ver.tmp
 	@echo " */" >> ver.tmp
@@ -83,7 +91,7 @@ stamp-vh: $(top_builddir)/configure.in
               echo timestamp > stamp-vh)
 	-@rm -f ver.tmp
 
-INCLUDES=-I$(top_srcdir)/include
+AM_CPPFLAGS=-I$(top_srcdir)/include
 
 install-data-hook:
 	test -d $(DESTDIR)$(sysincludedir) || mkdir -p $(DESTDIR)$(sysincludedir)

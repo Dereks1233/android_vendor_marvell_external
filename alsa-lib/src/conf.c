@@ -414,20 +414,27 @@ beginning:</P>
 */
 
 
+#include "local.h"
 #include <stdarg.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <locale.h>
-#include "local.h"
 #ifdef HAVE_LIBPTHREAD
 #include <pthread.h>
 #endif
 
 #ifndef DOC_HIDDEN
 
+#ifdef HAVE_LIBPTHREAD
+static pthread_mutex_t snd_config_update_mutex;
+static pthread_once_t snd_config_update_mutex_once = PTHREAD_ONCE_INIT;
+#endif
+
 struct _snd_config {
 	char *id;
 	snd_config_type_t type;
+	int refcount; /* default = 0 */
 	union {
 		long integer;
 		long long integer64;
@@ -449,6 +456,18 @@ struct filedesc {
 	snd_input_t *in;
 	unsigned int line, column;
 	struct filedesc *next;
+
+	/* list of the include paths (configuration directories),
+	 * defined by <searchdir:relative-path/to/top-alsa-conf-dir>,
+	 * for searching its included files.
+	 */
+	struct list_head include_paths;
+};
+
+/* path to search included files */
+struct include_path {
+	char *dir;
+	struct list_head list;
 };
 
 #define LOCAL_ERROR			(-0x68000000)
@@ -463,6 +482,169 @@ typedef struct {
 	int unget;
 	int ch;
 } input_t;
+
+#ifdef HAVE_LIBPTHREAD
+
+static void snd_config_init_mutex(void)
+{
+	pthread_mutexattr_t attr;
+
+	pthread_mutexattr_init(&attr);
+	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+	pthread_mutex_init(&snd_config_update_mutex, &attr);
+	pthread_mutexattr_destroy(&attr);
+}
+
+static inline void snd_config_lock(void)
+{
+	pthread_once(&snd_config_update_mutex_once, snd_config_init_mutex);
+	pthread_mutex_lock(&snd_config_update_mutex);
+}
+
+static inline void snd_config_unlock(void)
+{
+	pthread_mutex_unlock(&snd_config_update_mutex);
+}
+
+#else
+
+static inline void snd_config_lock(void) { }
+static inline void snd_config_unlock(void) { }
+
+#endif
+
+/*
+ * Add a diretory to the paths to search included files.
+ * param fd -  File object that owns these paths to search files included by it.
+ * param dir - Path of the directory to add. Allocated externally and need to
+*              be freed manually later.
+ * return - Zero if successful, otherwise a negative error code.
+ *
+ * The direcotry should be a subdiretory of top configuration directory
+ * "/usr/share/alsa/".
+ */
+static int add_include_path(struct filedesc *fd, char *dir)
+{
+	struct include_path *path;
+
+	path = calloc(1, sizeof(*path));
+	if (!path)
+		return -ENOMEM;
+
+	path->dir = dir;
+	list_add_tail(&path->list, &fd->include_paths);
+	return 0;
+}
+
+/*
+ * Free all include paths of a file descriptor.
+ * param fd - File object that owns these paths to search files included by it.
+ */
+static void free_include_paths(struct filedesc *fd)
+{
+	struct list_head *pos, *npos, *base;
+	struct include_path *path;
+
+	base = &fd->include_paths;
+	list_for_each_safe(pos, npos, base) {
+		path = list_entry(pos, struct include_path, list);
+		list_del(&path->list);
+		if (path->dir)
+			free(path->dir);
+		free(path);
+	}
+}
+
+/**
+ * \brief Returns the default top-level config directory
+ * \return The top-level config directory path string
+ *
+ * This function returns the string of the top-level config directory path.
+ * If the path is specified via the environment variable \c ALSA_CONFIG_DIR
+ * and the value is a valid path, it returns this value.  If unspecified, it
+ * returns the default value, "/usr/share/alsa".
+ */
+const char *snd_config_topdir(void)
+{
+	static char *topdir;
+
+	if (!topdir) {
+		topdir = getenv("ALSA_CONFIG_DIR");
+		if (!topdir || *topdir != '/' || strlen(topdir) >= PATH_MAX)
+			topdir = ALSA_CONFIG_DIR;
+	}
+	return topdir;
+}
+
+static char *_snd_config_path(const char *name)
+{
+	const char *root = snd_config_topdir();
+	char *path = malloc(strlen(root) + strlen(name) + 2);
+	if (!path)
+		return NULL;
+	sprintf(path, "%s/%s", root, name);
+	return path;
+}
+
+/*
+ * Search and open a file, and creates a new input object reading from the file.
+ * param inputp - The functions puts the pointer to the new input object
+ *               at the address specified by \p inputp.
+ * param file - Name of the configuration file.
+ * param include_paths - Optional, addtional directories to search the file.
+ * return - Zero if successful, otherwise a negative error code.
+ *
+ * This function will search and open the file in the following order
+ * of priority:
+ * 1. directly open the file by its name;
+ * 2. search for the file name in top configuration directory
+ *     "/usr/share/alsa/";
+ * 3. search for the file name in in additional configuration directories
+ *     specified by users, via alsaconf syntax
+ *     <searchdir:relative-path/to/user/share/alsa>;
+ *     These directories should be subdirectories of /usr/share/alsa.
+ */
+static int input_stdio_open(snd_input_t **inputp, const char *file,
+			    struct list_head *include_paths)
+{
+	struct list_head *pos, *base;
+	struct include_path *path;
+	char full_path[PATH_MAX + 1];
+	int err = 0;
+
+	err = snd_input_stdio_open(inputp, file, "r");
+	if (err == 0)
+		goto out;
+
+	if (file[0] == '/') /* not search file with absolute path */
+		return err;
+
+	/* search file in top configuration directory /usr/share/alsa */
+	snprintf(full_path, PATH_MAX, "%s/%s", snd_config_topdir(), file);
+	err = snd_input_stdio_open(inputp, full_path, "r");
+	if (err == 0)
+		goto out;
+
+	/* search file in user specified include paths. These directories
+	 * are subdirectories of /usr/share/alsa.
+	 */
+	if (include_paths) {
+		base = include_paths;
+		list_for_each(pos, base) {
+			path = list_entry(pos, struct include_path, list);
+			if (!path->dir)
+				continue;
+
+			snprintf(full_path, PATH_MAX, "%s/%s", path->dir, file);
+			err = snd_input_stdio_open(inputp, full_path, "r");
+			if (err == 0)
+				goto out;
+		}
+	}
+
+out:
+	return err;
+}
 
 static int safe_strtoll(const char *str, long long *val)
 {
@@ -499,22 +681,38 @@ static int safe_strtod(const char *str, double *val)
 {
 	char *end;
 	double v;
+#ifdef HAVE_USELOCALE
+	locale_t saved_locale, c_locale;
+#else
 	char *saved_locale;
 	char locstr[64]; /* enough? */
+#endif
 	int err;
 
 	if (!*str)
 		return -EINVAL;
+#ifdef HAVE_USELOCALE
+	c_locale = newlocale(LC_NUMERIC_MASK, "C", 0);
+	saved_locale = uselocale(c_locale);
+#else
 	saved_locale = setlocale(LC_NUMERIC, NULL);
 	if (saved_locale) {
 		snprintf(locstr, sizeof(locstr), "%s", saved_locale);
 		setlocale(LC_NUMERIC, "C");
 	}
+#endif
 	errno = 0;
 	v = strtod(str, &end);
 	err = -errno;
+#ifdef HAVE_USELOCALE
+	if (c_locale != (locale_t)0) {
+		uselocale(saved_locale);
+		freelocale(c_locale);
+	}
+#else
 	if (saved_locale)
 		setlocale(LC_NUMERIC, locstr);
+#endif
 	if (err)
 		return err;
 	if (*end)
@@ -576,20 +774,49 @@ static int get_char_skip_comments(input_t *input)
 			char *str;
 			snd_input_t *in;
 			struct filedesc *fd;
+			DIR *dirp;
 			int err = get_delimstring(&str, '>', input);
 			if (err < 0)
 				return err;
-			if (!strncmp(str, "confdir:", 8)) {
-				char *tmp = malloc(strlen(ALSA_CONFIG_DIR) + 1 + strlen(str + 8) + 1);
-				if (tmp == NULL) {
-					free(str);
-					return -ENOMEM;
-				}
-				sprintf(tmp, ALSA_CONFIG_DIR "/%s", str + 8);
+
+			if (!strncmp(str, "searchdir:", 10)) {
+				/* directory to search included files */
+				char *tmp = _snd_config_path(str + 10);
 				free(str);
+				if (tmp == NULL)
+					return -ENOMEM;
 				str = tmp;
+
+				dirp = opendir(str);
+				if (!dirp) {
+					SNDERR("Invalid search dir %s", str);
+					free(str);
+					return -EINVAL;
+				}
+				closedir(dirp);
+
+				err = add_include_path(input->current, str);
+				if (err < 0) {
+					SNDERR("Cannot add search dir %s", str);
+					free(str);
+					return err;
+				}
+				continue;
 			}
-			err = snd_input_stdio_open(&in, str, "r");
+
+			if (!strncmp(str, "confdir:", 8)) {
+				/* file in the specified directory */
+				char *tmp = _snd_config_path(str + 8);
+				free(str);
+				if (tmp == NULL)
+					return -ENOMEM;
+				str = tmp;
+				err = snd_input_stdio_open(&in, str, "r");
+			} else { /* absolute or relative file path */
+				err = input_stdio_open(&in, str,
+						&input->current->include_paths);
+			}
+
 			if (err < 0) {
 				SNDERR("Cannot access file %s", str);
 				free(str);
@@ -605,6 +832,7 @@ static int get_char_skip_comments(input_t *input)
 			fd->next = input->current;
 			fd->line = 1;
 			fd->column = 0;
+			INIT_LIST_HEAD(&fd->include_paths);
 			input->current = fd;
 			continue;
 		}
@@ -1337,7 +1565,7 @@ static int _snd_config_save_node_value(snd_config_t *n, snd_output_t *out,
 		snd_output_printf(out, "%ld", n->u.integer);
 		break;
 	case SND_CONFIG_TYPE_INTEGER64:
-		snd_output_printf(out, "%Ld", n->u.integer64);
+		snd_output_printf(out, "%lld", n->u.integer64);
 		break;
 	case SND_CONFIG_TYPE_REAL:
 		snd_output_printf(out, "%-16g", n->u.real);
@@ -1615,6 +1843,7 @@ static int snd_config_load1(snd_config_t *config, snd_input_t *in, int override)
 	fd->line = 1;
 	fd->column = 0;
 	fd->next = NULL;
+	INIT_LIST_HEAD(&fd->include_paths);
 	input.current = fd;
 	input.unget = 0;
 	err = parse_defs(config, &input, 0, override);
@@ -1655,9 +1884,12 @@ static int snd_config_load1(snd_config_t *config, snd_input_t *in, int override)
 		fd_next = fd->next;
 		snd_input_close(fd->in);
 		free(fd->name);
+		free_include_paths(fd);
 		free(fd);
 		fd = fd_next;
 	}
+
+	free_include_paths(fd);
 	free(fd);
 	return err;
 }
@@ -1773,6 +2005,10 @@ int snd_config_remove(snd_config_t *config)
  * If the node is a compound node, its descendants (the whole subtree)
  * are deleted recursively.
  *
+ * The function is supposed to be called only for locally copied config
+ * trees.  For the global tree, take the reference via #snd_config_update_ref
+ * and free it via #snd_config_unref.
+ *
  * \par Conforming to:
  * LSB 3.2
  *
@@ -1781,6 +2017,10 @@ int snd_config_remove(snd_config_t *config)
 int snd_config_delete(snd_config_t *config)
 {
 	assert(config);
+	if (config->refcount > 0) {
+		config->refcount--;
+		return 0;
+	}
 	switch (config->type) {
 	case SND_CONFIG_TYPE_COMPOUND:
 	{
@@ -2175,6 +2415,38 @@ int snd_config_imake_string(snd_config_t **config, const char *id, const char *v
 	*config = tmp;
 	return 0;
 }
+
+int snd_config_imake_safe_string(snd_config_t **config, const char *id, const char *value)
+{
+	int err;
+	snd_config_t *tmp;
+	char *c;
+
+	err = snd_config_make(&tmp, id, SND_CONFIG_TYPE_STRING);
+	if (err < 0)
+		return err;
+	if (value) {
+		tmp->u.string = strdup(value);
+		if (!tmp->u.string) {
+			snd_config_delete(tmp);
+			return -ENOMEM;
+		}
+
+		for (c = tmp->u.string; *c; c++) {
+			if (*c == ' ' || *c == '-' || *c == '_' ||
+				(*c >= '0' && *c <= '9') ||
+				(*c >= 'a' && *c <= 'z') ||
+				(*c >= 'A' && *c <= 'Z'))
+					continue;
+			*c = '_';
+		}
+	} else {
+		tmp->u.string = NULL;
+	}
+	*config = tmp;
+	return 0;
+}
+
 
 /**
  * \brief Creates a pointer configuration node with the given initial value.
@@ -2589,7 +2861,7 @@ int snd_config_get_ascii(const snd_config_t *config, char **ascii)
 		{
 			char res[32];
 			int err;
-			err = snprintf(res, sizeof(res), "%Li", config->u.integer64);
+			err = snprintf(res, sizeof(res), "%lli", config->u.integer64);
 			if (err < 0 || err == sizeof(res)) {
 				assert(0);
 				return -ENOMEM;
@@ -3158,9 +3430,6 @@ int snd_config_search_alias_hooks(snd_config_t *config,
 /** The name of the environment variable containing the files list for #snd_config_update. */
 #define ALSA_CONFIG_PATH_VAR "ALSA_CONFIG_PATH"
 
-/** The name of the default files used by #snd_config_update. */
-#define ALSA_CONFIG_PATH_DEFAULT ALSA_CONFIG_DIR "/alsa.conf"
-
 /**
  * \ingroup Config
  * \brief Configuration top-level node (the global configuration).
@@ -3228,6 +3497,7 @@ static int snd_config_hooks_call(snd_config_t *root, snd_config_t *config, snd_c
 		snd_config_iterator_t i, next;
 		if (snd_config_get_type(func_conf) != SND_CONFIG_TYPE_COMPOUND) {
 			SNDERR("Invalid type for func %s definition", str);
+			err = -EINVAL;
 			goto _err;
 		}
 		snd_config_for_each(i, next, func_conf) {
@@ -3302,6 +3572,7 @@ static int snd_config_hooks(snd_config_t *config, snd_config_t *private_data)
 
 	if ((err = snd_config_search(config, "@hooks", &n)) < 0)
 		return 0;
+	snd_config_lock();
 	snd_config_remove(n);
 	do {
 		hit = 0;
@@ -3318,7 +3589,7 @@ static int snd_config_hooks(snd_config_t *config, snd_config_t *private_data)
 			if (i == idx) {
 				err = snd_config_hooks_call(config, n, private_data);
 				if (err < 0)
-					return err;
+					goto _err;
 				idx++;
 				hit = 1;
 			}
@@ -3327,6 +3598,43 @@ static int snd_config_hooks(snd_config_t *config, snd_config_t *private_data)
 	err = 0;
        _err:
 	snd_config_delete(n);
+	snd_config_unlock();
+	return err;
+}
+
+static int config_filename_filter(const struct dirent *dirent)
+{
+	size_t flen;
+
+	if (dirent == NULL)
+		return 0;
+	if (dirent->d_type == DT_DIR)
+		return 0;
+
+	flen = strlen(dirent->d_name);
+	if (flen <= 5)
+		return 0;
+
+	if (strncmp(&dirent->d_name[flen-5], ".conf", 5) == 0)
+		return 1;
+
+	return 0;
+}
+
+static int config_file_open(snd_config_t *root, const char *filename)
+{
+	snd_input_t *in;
+	int err;
+
+	err = snd_input_stdio_open(&in, filename, "r");
+	if (err >= 0) {
+		err = snd_config_load(root, in);
+		snd_input_close(in);
+		if (err < 0)
+			SNDERR("%s may be old or corrupted: consider to remove or fix it", filename);
+	} else
+		SNDERR("cannot access file %s", filename);
+
 	return err;
 }
 
@@ -3414,20 +3722,46 @@ int snd_config_hook_load(snd_config_t *root, snd_config_t *config, snd_config_t 
 		}
 	} while (hit);
 	for (idx = 0; idx < fi_count; idx++) {
-		snd_input_t *in;
+		struct stat st;
 		if (!errors && access(fi[idx].name, R_OK) < 0)
 			continue;
-		err = snd_input_stdio_open(&in, fi[idx].name, "r");
-		if (err >= 0) {
-			err = snd_config_load(root, in);
-			snd_input_close(in);
-			if (err < 0) {
-				SNDERR("%s may be old or corrupted: consider to remove or fix it", fi[idx].name);
-				goto _err;
-			}
-		} else {
-			SNDERR("cannot access file %s", fi[idx].name);
+		if (stat(fi[idx].name, &st) < 0) {
+			SNDERR("cannot stat file/directory %s", fi[idx].name);
+			continue;
 		}
+		if (S_ISDIR(st.st_mode)) {
+			struct dirent **namelist;
+			int n;
+
+#ifndef DOC_HIDDEN
+#if defined(_GNU_SOURCE) && !defined(__NetBSD__) && !defined(__FreeBSD__) && !defined(__sun)
+#define SORTFUNC	versionsort
+#else
+#define SORTFUNC	alphasort
+#endif
+#endif
+			n = scandir(fi[idx].name, &namelist, config_filename_filter, SORTFUNC);
+			if (n > 0) {
+				int j;
+				err = 0;
+				for (j = 0; j < n; ++j) {
+					if (err >= 0) {
+						int sl = strlen(fi[idx].name) + strlen(namelist[j]->d_name) + 2;
+						char *filename = malloc(sl);
+						snprintf(filename, sl, "%s/%s", fi[idx].name, namelist[j]->d_name);
+						filename[sl-1] = '\0';
+
+						err = config_file_open(root, filename);
+						free(filename);
+					}
+					free(namelist[j]);
+				}
+				free(namelist);
+				if (err < 0)
+					goto _err;
+			}
+		} else if ((err = config_file_open(root, fi[idx].name)) < 0)
+			goto _err;
 	}
 	*dst = NULL;
 	err = 0;
@@ -3554,8 +3888,13 @@ int snd_config_update_r(snd_config_t **_top, snd_config_update_t **_update, cons
 	configs = cfgs;
 	if (!configs) {
 		configs = getenv(ALSA_CONFIG_PATH_VAR);
-		if (!configs || !*configs)
-			configs = ALSA_CONFIG_PATH_DEFAULT;
+		if (!configs || !*configs) {
+			const char *topdir = snd_config_topdir();
+			char *s = alloca(strlen(topdir) +
+					 strlen("alsa.conf") + 2);
+			sprintf(s, "%s/alsa.conf", topdir);
+			configs = s;
+		}
 	}
 	for (k = 0, c = configs; (l = strcspn(c, ": ")) > 0; ) {
 		c += l;
@@ -3676,10 +4015,6 @@ int snd_config_update_r(snd_config_t **_top, snd_config_update_t **_update, cons
 	return 1;
 }
 
-#ifdef HAVE_LIBPTHREAD
-static pthread_mutex_t snd_config_update_mutex = PTHREAD_MUTEX_INITIALIZER;
-#endif
-
 /** 
  * \brief Updates #snd_config by rereading the global configuration files (if needed).
  * \return 0 if #snd_config was up to date, 1 if #snd_config was
@@ -3688,6 +4023,8 @@ static pthread_mutex_t snd_config_update_mutex = PTHREAD_MUTEX_INITIALIZER;
  * \warning Whenever #snd_config is updated, all string pointers and
  * configuration node handles previously obtained from it may become
  * invalid.
+ * For safer operations, use #snd_config_update_ref and release the config
+ * via #snd_config_unref.
  *
  * \par Errors:
  * Any errors encountered when parsing the input or returned by hooks or
@@ -3700,14 +4037,78 @@ int snd_config_update(void)
 {
 	int err;
 
-#ifdef HAVE_LIBPTHREAD
-	pthread_mutex_lock(&snd_config_update_mutex);
-#endif
+	snd_config_lock();
 	err = snd_config_update_r(&snd_config, &snd_config_global_update, NULL);
-#ifdef HAVE_LIBPTHREAD
-	pthread_mutex_unlock(&snd_config_update_mutex);
-#endif
+	snd_config_unlock();
 	return err;
+}
+
+/**
+ * \brief Updates #snd_config and takes its reference.
+ * \return 0 if #snd_config was up to date, 1 if #snd_config was
+ *         updated, otherwise a negative error code.
+ *
+ * Unlike #snd_config_update, this function increases a reference counter
+ * so that the obtained tree won't be deleted until unreferenced by
+ * #snd_config_unref.
+ *
+ * This function is supposed to be thread-safe.
+ */
+int snd_config_update_ref(snd_config_t **top)
+{
+	int err;
+
+	if (top)
+		*top = NULL;
+	snd_config_lock();
+	err = snd_config_update_r(&snd_config, &snd_config_global_update, NULL);
+	if (err >= 0) {
+		if (snd_config) {
+			if (top) {
+				snd_config->refcount++;
+				*top = snd_config;
+			}
+		} else {
+			err = -ENODEV;
+		}
+	}
+	snd_config_unlock();
+	return err;
+}
+
+/**
+ * \brief Take the reference of the config tree.
+ *
+ * Increases a reference counter of the given config tree.
+ *
+ * This function is supposed to be thread-safe.
+ */
+void snd_config_ref(snd_config_t *cfg)
+{
+	snd_config_lock();
+	if (cfg)
+		cfg->refcount++;
+	snd_config_unlock();
+}
+
+/**
+ * \brief Unreference the config tree.
+ *
+ * Decreases a reference counter of the given config tree, and eventually
+ * deletes the tree if all references are gone.  This is the counterpart of
+ * #snd_config_unref.
+ *
+ * Also, the config taken via #snd_config_update_ref must be unreferenced
+ * by this function, too.
+ *
+ * This function is supposed to be thread-safe.
+ */
+void snd_config_unref(snd_config_t *cfg)
+{
+	snd_config_lock();
+	if (cfg)
+		snd_config_delete(cfg);
+	snd_config_unlock();
 }
 
 /** 
@@ -3739,18 +4140,14 @@ int snd_config_update_free(snd_config_update_t *update)
  */
 int snd_config_update_free_global(void)
 {
-#ifdef HAVE_LIBPTHREAD
-	pthread_mutex_lock(&snd_config_update_mutex);
-#endif
+	snd_config_lock();
 	if (snd_config)
 		snd_config_delete(snd_config);
 	snd_config = NULL;
 	if (snd_config_global_update)
 		snd_config_update_free(snd_config_global_update);
 	snd_config_global_update = NULL;
-#ifdef HAVE_LIBPTHREAD
-	pthread_mutex_unlock(&snd_config_update_mutex);
-#endif
+	snd_config_unlock();
 	/* FIXME: better to place this in another place... */
 	snd_dlobj_cache_cleanup();
 
@@ -4093,6 +4490,7 @@ static int _snd_config_evaluate(snd_config_t *src,
 			snd_config_iterator_t i, next;
 			if (snd_config_get_type(func_conf) != SND_CONFIG_TYPE_COMPOUND) {
 				SNDERR("Invalid type for func %s definition", str);
+				err = -EINVAL;
 				goto _err;
 			}
 			snd_config_for_each(i, next, func_conf) {
@@ -4641,7 +5039,7 @@ int snd_config_expand(snd_config_t *config, snd_config_t *root, const char *args
 		snd_config_delete(subs);
 	return err;
 }
-	
+
 /**
  * \brief Searches for a definition in a configuration tree, using
  *        aliases and expanding hooks and arguments.
@@ -4691,10 +5089,15 @@ int snd_config_search_definition(snd_config_t *config,
 	 *  if key contains dot (.), the implicit base is ignored
 	 *  and the key starts from root given by the 'config' parameter
 	 */
+	snd_config_lock();
 	err = snd_config_search_alias_hooks(config, strchr(key, '.') ? NULL : base, key, &conf);
-	if (err < 0)
+	if (err < 0) {
+		snd_config_unlock();
 		return err;
-	return snd_config_expand(conf, config, args, NULL, result);
+	}
+	err = snd_config_expand(conf, config, args, NULL, result);
+	snd_config_unlock();
+	return err;
 }
 
 #ifndef DOC_HIDDEN
@@ -4733,3 +5136,39 @@ static void _snd_config_end(void)
 	files_info_count = 0;
 }
 #endif
+
+size_t page_size(void)
+{
+	long s = sysconf(_SC_PAGE_SIZE);
+	assert(s > 0);
+	return s;
+}
+
+size_t page_align(size_t size)
+{
+	size_t r;
+	long psz = page_size();
+	r = size % psz;
+	if (r)
+		return size + psz - r;
+	return size;
+}
+
+size_t page_ptr(size_t object_offset, size_t object_size, size_t *offset, size_t *mmap_offset)
+{
+	size_t r;
+	long psz = page_size();
+	assert(offset);
+	assert(mmap_offset);
+	*mmap_offset = object_offset;
+	object_offset %= psz;
+	*mmap_offset -= object_offset;
+	object_size += object_offset;
+	r = object_size % psz;
+	if (r)
+		r = object_size + psz - r;
+	else
+		r = object_size;
+	*offset = object_offset;
+	return r;
+}

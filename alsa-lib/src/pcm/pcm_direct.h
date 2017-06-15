@@ -66,6 +66,7 @@ typedef struct {
 	char socket_name[256];			/* name of communication socket */
 	snd_pcm_type_t type;			/* PCM type (currently only hw) */
 	int use_server;
+	unsigned int recoveries;		/* no of executed recoveries on slave*/
 	struct {
 		unsigned int format;
 		snd_interval_t rate;
@@ -85,8 +86,8 @@ typedef struct {
 		unsigned int period_size;
 		unsigned int period_time;
 		snd_interval_t periods;
-		unsigned int monotonic;
 		snd_pcm_tstamp_t tstamp_mode;
+		snd_pcm_tstamp_type_t tstamp_type;
 		unsigned int period_step;
 		unsigned int sleep_min; /* not used */
 		unsigned int avail_min;
@@ -122,6 +123,7 @@ struct snd_pcm_direct {
 	mode_t ipc_perm;		/* IPC socket permissions */
 	int ipc_gid;			/* IPC socket gid */
 	int semid;			/* IPC global semaphore identification */
+	int locked[DIRECT_IPC_SEMS];	/* local lock counter */
 	int shmid;			/* IPC global shared memory identification */
 	snd_pcm_direct_share_t *shmptr;	/* pointer to shared memory area */
 	snd_pcm_t *spcm; 		/* slave PCM handle */
@@ -137,6 +139,7 @@ struct snd_pcm_direct {
 	int (*sync_ptr)(snd_pcm_t *pcm);
 	snd_pcm_state_t state;
 	snd_htimestamp_t trigger_tstamp;
+	snd_htimestamp_t update_tstamp;
 	int server, client;
 	int comm_fd;			/* communication file descriptor (socket) */
 	int hw_fd;			/* hardware file descriptor */
@@ -145,14 +148,18 @@ struct snd_pcm_direct {
 	int tread: 1;
 	int timer_need_poll: 1;
 	unsigned int timer_events;
+	unsigned int timer_ticks;
 	int server_fd;
 	pid_t server_pid;
 	snd_timer_t *timer; 		/* timer used as poll_fd */
 	int interleaved;	 	/* we have interleaved buffer */
 	int slowptr;			/* use slow but more precise ptr updates */
 	int max_periods;		/* max periods (-1 = fixed periods, 0 = max buffer size) */
+	int var_periodsize;		/* allow variable period size if max_periods is != -1*/
 	unsigned int channels;		/* client's channels */
 	unsigned int *bindings;
+	unsigned int recoveries;	/* mirror of executed recoveries on slave */
+	int direct_memory_access;	/* use arch-optimized buffer RW */
 	union {
 		struct {
 			int shmid_sum;			/* IPC global sum ring buffer memory identification */
@@ -222,6 +229,8 @@ struct snd_pcm_direct {
 	snd1_pcm_direct_mmap
 #define snd_pcm_direct_munmap \
 	snd1_pcm_direct_munmap
+#define snd_pcm_direct_prepare \
+	snd1_pcm_direct_prepare
 #define snd_pcm_direct_resume \
 	snd1_pcm_direct_resume
 #define snd_pcm_direct_timer_stop \
@@ -234,6 +243,12 @@ struct snd_pcm_direct {
 	snd1_pcm_direct_open_secondary_client
 #define snd_pcm_direct_parse_open_conf \
 	snd1_pcm_direct_parse_open_conf
+#define snd_pcm_direct_query_chmaps \
+	snd1_pcm_direct_query_chmaps
+#define snd_pcm_direct_get_chmap \
+	snd1_pcm_direct_get_chmap
+#define snd_pcm_direct_set_chmap \
+	snd1_pcm_direct_set_chmap
 
 int snd_pcm_direct_semaphore_create_or_connect(snd_pcm_direct_t *dmix);
 
@@ -250,13 +265,32 @@ static inline int snd_pcm_direct_semaphore_discard(snd_pcm_direct_t *dmix)
 static inline int snd_pcm_direct_semaphore_down(snd_pcm_direct_t *dmix, int sem_num)
 {
 	struct sembuf op[2] = { { sem_num, 0, 0 }, { sem_num, 1, SEM_UNDO } };
-	return semop(dmix->semid, op, 2);
+	int err = semop(dmix->semid, op, 2);
+	if (err == 0)
+		dmix->locked[sem_num]++;
+	else if (err == -1)
+		err = -errno;
+	return err;
 }
 
 static inline int snd_pcm_direct_semaphore_up(snd_pcm_direct_t *dmix, int sem_num)
 {
 	struct sembuf op = { sem_num, -1, SEM_UNDO | IPC_NOWAIT };
-	return semop(dmix->semid, &op, 1);
+	int err = semop(dmix->semid, &op, 1);
+	if (err == 0)
+		dmix->locked[sem_num]--;
+	else if (err == -1)
+		err = -errno;
+	return err;
+}
+
+static inline int snd_pcm_direct_semaphore_final(snd_pcm_direct_t *dmix, int sem_num)
+{
+	if (dmix->locked[sem_num] != 1) {
+		SNDMSG("invalid semaphore count to finalize %d: %d", sem_num, dmix->locked[sem_num]);
+		return -EBUSY;
+	}
+	return snd_pcm_direct_semaphore_up(dmix, sem_num);
 }
 
 int snd_pcm_direct_shm_create_or_connect(snd_pcm_direct_t *dmix);
@@ -274,6 +308,8 @@ int snd_pcm_direct_parse_bindings(snd_pcm_direct_t *dmix,
 				  snd_config_t *cfg);
 int snd_pcm_direct_nonblock(snd_pcm_t *pcm, int nonblock);
 int snd_pcm_direct_async(snd_pcm_t *pcm, int sig, pid_t pid);
+int snd_pcm_direct_poll_descriptors(snd_pcm_t *pcm, struct pollfd *pfds,
+				    unsigned int space);
 int snd_pcm_direct_poll_revents(snd_pcm_t *pcm, struct pollfd *pfds, unsigned int nfds, unsigned short *revents);
 int snd_pcm_direct_info(snd_pcm_t *pcm, snd_pcm_info_t * info);
 int snd_pcm_direct_hw_refine(snd_pcm_t *pcm, snd_pcm_hw_params_t *params);
@@ -283,12 +319,18 @@ int snd_pcm_direct_sw_params(snd_pcm_t *pcm, snd_pcm_sw_params_t * params);
 int snd_pcm_direct_channel_info(snd_pcm_t *pcm, snd_pcm_channel_info_t * info);
 int snd_pcm_direct_mmap(snd_pcm_t *pcm);
 int snd_pcm_direct_munmap(snd_pcm_t *pcm);
+int snd_pcm_direct_prepare(snd_pcm_t *pcm);
 int snd_pcm_direct_resume(snd_pcm_t *pcm);
 int snd_pcm_direct_timer_stop(snd_pcm_direct_t *dmix);
-void snd_pcm_direct_clear_timer_queue(snd_pcm_direct_t *dmix);
+int snd_pcm_direct_clear_timer_queue(snd_pcm_direct_t *dmix);
 int snd_pcm_direct_set_timer_params(snd_pcm_direct_t *dmix);
 int snd_pcm_direct_open_secondary_client(snd_pcm_t **spcmp, snd_pcm_direct_t *dmix, const char *client_name);
 
+snd_pcm_chmap_query_t **snd_pcm_direct_query_chmaps(snd_pcm_t *pcm);
+snd_pcm_chmap_t *snd_pcm_direct_get_chmap(snd_pcm_t *pcm);
+int snd_pcm_direct_set_chmap(snd_pcm_t *pcm, const snd_pcm_chmap_t *map);
+int snd_pcm_direct_slave_recover(snd_pcm_direct_t *direct);
+int snd_pcm_direct_client_chk_xrun(snd_pcm_direct_t *direct, snd_pcm_t *pcm);
 int snd_timer_async(snd_timer_t *timer, int sig, pid_t pid);
 struct timespec snd_pcm_hw_fast_tstamp(snd_pcm_t *pcm);
 
@@ -298,6 +340,8 @@ struct snd_pcm_direct_open_conf {
 	int ipc_gid;
 	int slowptr;
 	int max_periods;
+	int var_periodsize;
+	int direct_memory_access;
 	snd_config_t *slave;
 	snd_config_t *bindings;
 };
