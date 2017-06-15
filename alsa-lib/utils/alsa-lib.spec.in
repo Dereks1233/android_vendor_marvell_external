@@ -1,75 +1,78 @@
 %define ver      @SND_LIB_VERSION@
 %define rel      1
+%define prefix   /
 
 Summary: Advanced Linux Sound Architecture (ALSA) - Library
 Name: alsa-lib
 Version: %ver
 Release: %rel
-License: LGPL
+Copyright: GPL
 Group: System/Libraries
-Source: ftp://ftp.alsa-project.org/pub/lib/alsa-lib-%{ver}.tar.bz2
-BuildRoot: %{_tmppath}/%{name}-%{version}-root
-URL: http://www.alsa-project.org
+Source: ftp://alsa.jcu.cz/pub/lib/alsa-lib-%{ver}.tar.gz
+BuildRoot: /tmp/alsa-lib-%{ver}
+Packager: Helge Jensen <slog@slog.dk>
+URL: http://alsa.jcu.cz
+Docdir: %{prefix}/usr/doc
+Requires: alsa-driver
 
 %description
 
 Advanced Linux Sound Architecture (ALSA) - Library
 
-%package -n alsa-lib-devel
-Summary: ALSA Libraries Development Files
-Group: Development/Libraries
-Requires: %{name} = %{version}-%{release}
+Features
+========
 
-%description -n alsa-lib-devel
-Development files for building applications which use the ALSA libraries.
+* general
+  - modularized architecture with support for 2.0 and latest 2.1 kernels
+  - support for versioned and exported symbols
+  - full proc filesystem support - /proc/sound
+* ISA soundcards
+  - support for 128k ISA DMA buffer
+* mixer
+  - new enhanced API for applications
+  - support for unlimited number of channels
+  - volume can be set in three ways (percentual (0-100), exact and decibel)
+  - support for mute (and hardware mute if hardware supports it)
+  - support for mixer events
+    - this allows two or more applications to be synchronized
+* digital audio (PCM)
+  - new enhanced API for applications
+  - full real duplex support
+  - full duplex support for SoundBlaster 16/AWE soundcards
+  - digital audio data for playback and record should be read back using
+    proc filesystem
+* OSS/Lite compatibility
+  - full mixer compatibity
+  - full PCM (/dev/dsp) compatibility
 
 %changelog
-* Sat Feb 22 2003 Ronny V. Vindenes <sublett@dc-s.com>
-- split alsa-lib into alsa-lib and alsa-lib-devel
-- changed which files are installed (now includes alsa.pc)
-- use standard rpm macros for build and install
-- changed BuildRoot from /var/tmp to %{_tmppath}
-
-* Tue Nov 20 2001 Jaroslav Kysela <perex@perex.cz>
-
-- changed BuildRoot from /tmp to /var/tmp
-- use the standard RPM macros for prefix and paths
-- added DESTDIR for make install
-
-* Sun Nov 11 2001 Miroslav Benes <mbenes@tenez.cz>
-
-- dangerous command "rpm -rf $RPM_BUILD_ROOT" checks $RPM_BUILD_ROOT variable
-- unset key "Docdir" - on some new systems are documentation in /usr/share/doc
 
 * Mon May 28 1998 Helge Jensen <slog@slog.dk>
 
 - Made SPEC file
 
 %prep
-%setup
+%setup -n alsa-lib
 %build
-%configure
+
+./configure --prefix=/usr
 make
 
 %install
-[ "$RPM_BUILD_ROOT" != "/" ] && rm -rf $RPM_BUILD_ROOT
-%makeinstall
+mkdir -p $RPM_BUILD_ROOT/usr/include/sys
+mkdir -p $RPM_BUILD_ROOT/usr/lib
+
+make prefix="$RPM_BUILD_ROOT/usr" install
 
 %clean
-[ "$RPM_BUILD_ROOT" != "/" ] && rm -rf $RPM_BUILD_ROOT
+rm -rf $RPM_BUILD_ROOT
 
 %files
 %defattr(-, root, root)
-%{_bindir}/*
-%{_libdir}/*.so.*
-%{_datadir}/alsa
+
+%doc doc/*.html
+%doc doc/*.sgml
 %doc doc/*.txt
 
-%files -n alsa-lib-devel
-%defattr(-,root,root)
-%{_includedir}/alsa
-%{_includedir}/sys/*
-%{_libdir}/*.la
-%{_libdir}/*.so
-%{_datadir}/aclocal/*
-%{_libdir}/pkgconfig/*
+%{prefix}/usr/include/sys/soundlib.h
+%{prefix}/usr/lib/lib*

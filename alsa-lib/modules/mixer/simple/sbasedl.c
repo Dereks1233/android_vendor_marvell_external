@@ -32,6 +32,7 @@
 #include "asoundlib.h"
 #include "mixer_abst.h"
 #include "sbase.h"
+#include <errno.h>
 
 #define SO_PATH ALSA_PLUGIN_DIR "/smixer"
 

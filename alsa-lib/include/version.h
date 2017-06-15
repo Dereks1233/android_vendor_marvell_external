@@ -2,14 +2,8 @@
  *  version.h
  */
 
-#define SND_LIB_MAJOR		1 /**< major number of library version */
-#define SND_LIB_MINOR		1 /**< minor number of library version */
-#define SND_LIB_SUBMINOR	4 /**< subminor number of library version */
-#define SND_LIB_EXTRAVER	1000000 /**< extra version number, used mainly for betas */
-/** library version */
-#define SND_LIB_VERSION		((SND_LIB_MAJOR<<16)|\
-				 (SND_LIB_MINOR<<8)|\
-				  SND_LIB_SUBMINOR)
-/** library version (string) */
-#define SND_LIB_VERSION_STR	"1.1.4"
+#define SOUNDLIB_VERSION_MAJOR		0
+#define SOUNDLIB_VERSION_MINOR		0
+#define SOUNDLIB_VERSION_SUBMINOR	9
+#define SOUNDLIB_VERSION		( ( LIBULTRA_VERSION_MAJOR << 16 ) | ( LIBULTRA_VERSION_MINOR << 8 ) | LIB_ULTRA_VERSION_SUBMINOR )
 

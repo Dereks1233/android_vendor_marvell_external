@@ -29,6 +29,7 @@
 #include "asoundlib.h"
 #include "mixer_abst.h"
 #include "sbase.h"
+#include <errno.h>
 
 /*
  * Prototypes
@@ -43,7 +44,7 @@ static int selem_read(snd_mixer_elem_t *elem);
 static unsigned int chanmap_to_channels(unsigned int chanmap)
 {
 	unsigned int i, res;
-	
+
 	for (i = 0, res = 0; i < MAX_CHANNEL; i++)
 		if (chanmap & (1 << i))
 			res++;
@@ -61,7 +62,7 @@ static long to_user(struct selem_base *s, int dir, struct helem_base *c, long va
 }
 
 static long from_user(struct selem_base *s, int dir, struct helem_base *c, long value)
-{ 
+{
         int64_t n;
 	if (s->dir[dir].max == s->dir[dir].min)
 		return c->min;
@@ -77,7 +78,7 @@ static void update_ranges(struct selem_base *s)
 	unsigned int dir, ok_flag;
 	struct list_head *pos;
 	struct helem_base *helem;
-	
+
 	for (dir = 0; dir < 2; dir++) {
 		s->dir[dir].min = 0;
 		s->dir[dir].max = 0;
@@ -139,7 +140,7 @@ static int is_ops(snd_mixer_elem_t *elem, int dir, int cmd, int val)
 		helem = list_entry(s->helems.next, struct helem_base, list);
 		return !!(helem->purpose == PURPOSE_ENUMLIST);
 	}
-	
+
 	case SM_OPS_IS_ENUMCNT: {
 		struct helem_base *helem;
 		helem = list_entry(s->helems.next, struct helem_base, list);
@@ -147,7 +148,7 @@ static int is_ops(snd_mixer_elem_t *elem, int dir, int cmd, int val)
 	}
 
 	}
-	
+
 	return 1;
 }
 
@@ -155,7 +156,7 @@ static int get_range_ops(snd_mixer_elem_t *elem, int dir,
 			 long *min, long *max)
 {
 	struct selem_base *s = snd_mixer_elem_get_private(elem);
-	
+
 	*min = s->dir[dir].min;
 	*max = s->dir[dir].max;
 
@@ -179,7 +180,7 @@ static int set_range_ops(snd_mixer_elem_t *elem, int dir,
 	s->dir[dir].forced_range = 1;
 	s->dir[dir].min = min;
 	s->dir[dir].max = max;
-	
+
 	if ((err = selem_read(elem)) < 0)
 		return err;
 	return 0;
@@ -189,7 +190,7 @@ static int get_volume_ops(snd_mixer_elem_t *elem, int dir,
 			  snd_mixer_selem_channel_id_t channel, long *value)
 {
 	struct selem_base *s = snd_mixer_elem_get_private(elem);
-	
+
 	*value = s->dir[dir].vol[channel];
 	return 0;
 }
@@ -330,7 +331,7 @@ static int simple_event_add1(snd_mixer_class_t *class,
 	struct bclass_sid *bsid;
 	struct melem_sids *sid;
 	unsigned int ui;
-	
+
 	list_for_each(pos, &priv->sids) {
 		bsid = list_entry(pos, struct bclass_sid, list);
 		for (ui = 0; ui < bsid->count; ui++) {
@@ -361,7 +362,7 @@ static int simple_event_add1(snd_mixer_class_t *class,
 		min = max = 0;
 		break;
 	}
-	
+
 	printf("event add: %p, %p (%s)\n", helem, sel, snd_hctl_elem_get_name(helem));
 	if (snd_mixer_selem_id_malloc(&id))
 		return -ENOMEM;

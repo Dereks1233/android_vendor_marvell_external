@@ -24,6 +24,7 @@
 #include "config.h"
 #include "asoundlib.h"
 #include "mixer_abst.h"
+#include <errno.h>
 
 struct python_priv {
 	int py_initialized;
@@ -158,7 +159,7 @@ static int get_x_range_ops(snd_mixer_elem_t *elem, int dir,
 	PyObject *obj1, *res;
 	struct pymelem *pymelem = melem_to_pymelem(elem);
 	int err;
-	
+
 	obj1 = PyTuple_New(1);
 	PyTuple_SET_ITEM(obj1, 0, PyInt_FromLong(dir));
 	err = pcall(pymelem, attr, obj1, &res);
@@ -210,7 +211,7 @@ static int get_x_ops(snd_mixer_elem_t *elem, int dir,
 	PyObject *obj1, *res;
 	struct pymelem *pymelem = melem_to_pymelem(elem);
 	int err;
-	
+
 	obj1 = PyTuple_New(2);
 	PyTuple_SET_ITEM(obj1, 0, PyInt_FromLong(dir));
 	PyTuple_SET_ITEM(obj1, 1, PyInt_FromLong(channel));
@@ -268,7 +269,7 @@ static int ask_dB_vol_ops(snd_mixer_elem_t *elem,
 	PyObject *obj1, *res;
 	struct pymelem *pymelem = melem_to_pymelem(elem);
 	int err;
-	
+
 	obj1 = PyTuple_New(3);
 	PyTuple_SET_ITEM(obj1, 0, PyInt_FromLong(dir));
 	PyTuple_SET_ITEM(obj1, 1, PyInt_FromLong(value));
@@ -358,7 +359,7 @@ static int enum_item_name_ops(snd_mixer_elem_t *elem,
 	int err;
 	unsigned int len;
 	char *s;
-	
+
 	obj1 = PyTuple_New(1);
 	PyTuple_SET_ITEM(obj1, 0, PyInt_FromLong(item));
 	err = pcall(pymelem, "opsGetEnumItemName", obj1, &res);
@@ -389,7 +390,7 @@ static int get_enum_item_ops(snd_mixer_elem_t *elem,
 	PyObject *obj1, *res;
 	struct pymelem *pymelem = melem_to_pymelem(elem);
 	int err;
-	
+
 	obj1 = PyTuple_New(1);
 	PyTuple_SET_ITEM(obj1, 0, PyInt_FromLong(channel));
 	err = pcall(pymelem, "opsGetEnumItem", obj1, &res);
@@ -508,7 +509,7 @@ pymelem_attach(struct pymelem *pymelem, PyObject *args)
 	PyObject *obj;
 	snd_hctl_elem_t *helem;
 	int err;
-	
+
 	if (!PyArg_ParseTuple(args, "O", &obj))
 		return NULL;
 	helem = (snd_hctl_elem_t *)get_C_ptr(obj, "get_C_helem");
@@ -517,7 +518,7 @@ pymelem_attach(struct pymelem *pymelem, PyObject *args)
 	err = snd_mixer_elem_attach(pymelem->melem, helem);
 	if (err < 0) {
 		PyErr_Format(PyExc_RuntimeError, "Cannot attach hcontrol element to mixer element: %s", snd_strerror(err));
-		return NULL;		
+		return NULL;
 	}
 	Py_RETURN_NONE;
 }
@@ -528,7 +529,7 @@ pymelem_detach(struct pymelem *pymelem, PyObject *args)
 	PyObject *obj;
 	snd_hctl_elem_t *helem;
 	int err;
-	
+
 	if (!PyArg_ParseTuple(args, "O", &obj))
 		return NULL;
 	helem = (snd_hctl_elem_t *)get_C_ptr(obj, "get_C_helem");
@@ -537,7 +538,7 @@ pymelem_detach(struct pymelem *pymelem, PyObject *args)
 	err = snd_mixer_elem_detach(pymelem->melem, helem);
 	if (err < 0) {
 		PyErr_Format(PyExc_RuntimeError, "Cannot detach hcontrol element to mixer element: %s", snd_strerror(err));
-		return NULL;		
+		return NULL;
 	}
 	Py_RETURN_NONE;
 }
@@ -610,14 +611,14 @@ static PyGetSetDef pymelem_getseters[] = {
 
 	{"name", (getter)pymelem_get_name, NULL, NULL, NULL},
 	{"index", (getter)pymelem_get_index, NULL, NULL, NULL},
-	        
+
 	{NULL,NULL,NULL,NULL,NULL}
 };
 
 static PyMethodDef pymelem_methods[] = {
 	{"attach", (PyCFunction)pymelem_attach, METH_VARARGS, NULL},
 	{"detach", (PyCFunction)pymelem_detach, METH_VARARGS, NULL},
-	
+
 	/* "default" functions - no functionality */
 	{"opsIsActive", (PyCFunction)pymelem_ignore1, METH_VARARGS, NULL},
 	{"opsIsMono", (PyCFunction)pymelem_ignore, METH_VARARGS, NULL},
@@ -626,7 +627,7 @@ static PyMethodDef pymelem_methods[] = {
 	{"opsIsEnumCnt", (PyCFunction)pymelem_ignore, METH_VARARGS, NULL},
 
 	{"opsGetDB", (PyCFunction)pymelem_error, METH_VARARGS, NULL},
-	
+
 	{"eventInfo", (PyCFunction)pymelem_event_info, METH_VARARGS, NULL},
 	{"eventValue", (PyCFunction)pymelem_event_value, METH_VARARGS, NULL},
 
@@ -655,7 +656,7 @@ pymixer_attach_hctl(struct pymixer *pymixer, PyObject *args)
 	snd_hctl_t *hctl;
 	void **hctls;
 	int err;
-	
+
 	if (!PyArg_ParseTuple(args, "O", &obj))
 		return NULL;
 	hctl = (snd_hctl_t *)get_C_ptr(obj, "get_C_hctl");
@@ -683,7 +684,7 @@ static PyObject *
 pymixer_register(struct pymixer *pymixer, PyObject *args)
 {
 	int err;
-	
+
 	if (!PyArg_ParseTuple(args, ""))
 		return NULL;
 	err = snd_mixer_class_register(pymixer->class, pymixer->mixer);
@@ -700,7 +701,7 @@ pymixer_melement_new(struct pymixer *pymixer, PyObject *args)
 	PyObject *obj, *obj1, *obj2;
 	char *class, *name;
 	long index, weight;
-	
+
 	if (!PyArg_ParseTuple(args, "ssii", &class, &name, &index, &weight))
 		return NULL;
 	obj = PyDict_GetItemString(pymixer->mdict, class);
@@ -739,14 +740,14 @@ pymixer_melement_add(struct pymixer *pymixer, PyObject *args)
 	PyObject *obj;
 	struct pymelem *pymelem;
 	int err;
-	
+
 	if (!PyArg_ParseTuple(args, "O", &obj))
 		return NULL;
 	pymelem = (struct pymelem *)obj;
 	err = snd_mixer_elem_add(pymelem->melem, pymixer->class);
 	if (err < 0) {
 		PyErr_Format(PyExc_RuntimeError, "Cannot add mixer element: %s", snd_strerror(err));
-		return NULL;		
+		return NULL;
 	}
 	Py_RETURN_NONE;
 }
@@ -773,7 +774,7 @@ static void
 pymixer_free(struct pymixer *self)
 {
 	int idx;
-	
+
 	for (idx = 0; idx < self->hctl_count; idx++) {
 		snd_mixer_detach_hctl(self->mixer, self->hctl[idx*2]);
 		Py_DECREF((PyObject *)self->hctl[idx*2+1]);
@@ -916,7 +917,7 @@ int alsa_mixer_simple_event(snd_mixer_class_t *class, unsigned int mask,
 
 	tstate = PyThreadState_New(main_interpreter);
         origstate = PyThreadState_Swap(tstate);
-        
+
         t = PyTuple_New(3);
         if (t) {
         	PyTuple_SET_ITEM(t, 0, (PyObject *)PyInt_FromLong(mask));
@@ -947,7 +948,7 @@ int alsa_mixer_simple_event(snd_mixer_class_t *class, unsigned int mask,
 			res = -EIO;
 		}
 	}
-	
+
 	return res;
 }
 
@@ -991,7 +992,7 @@ int alsa_mixer_simple_finit(snd_mixer_class_t *class,
 		SNDERR("Unable to find python module '%s'", file);
 		return -ENODEV;
 	}
-	
+
 	Py_Initialize();
 	if (PyType_Ready(&pymelem_type) < 0)
 		return -EIO;
