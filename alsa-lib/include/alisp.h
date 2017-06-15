@@ -18,6 +18,12 @@
  *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  *
  */
+#ifndef snd_input_t
+#include "input.h"
+#endif
+#ifndef snd_output_t
+#include "output.h"
+#endif
 
 struct alisp_cfg {
 	int verbose: 1,

@@ -19,7 +19,6 @@
  *
  */
 
-#ifndef __LOCAL_H
 #define __LOCAL_H
 
 #include "config.h"
@@ -42,9 +41,6 @@
 #endif
 #ifndef __BIG_ENDIAN
 #define __BIG_ENDIAN BIG_ENDIAN
-#endif
-#else
-#error Header defining endianness not defined
 #endif
 #include <stdarg.h>
 #include <sys/poll.h>
