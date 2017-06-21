@@ -92,7 +92,7 @@ struct snd_ctl_ext {
 	/**
 	 * Driver name of this card; must be filled before calling #snd_ctl_ext_create()
 	 */
-	char driver[16];
+	char driver[32];
 	/**
 	 * short name of this card; must be filled before calling #snd_ctl_ext_create()
 	 */

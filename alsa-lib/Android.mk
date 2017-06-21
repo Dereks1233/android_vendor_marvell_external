@@ -13,18 +13,12 @@ LOCAL_MODULE := libasound
 LOCAL_PRELINK_MODULE := false
 LOCAL_MODULE_TAGS := optional
 LOCAL_ARM_MODE := arm
+
 LOCAL_C_INCLUDES += $(LOCAL_PATH)/include
 
 # libasound must be compiled with -fno-short-enums, as it makes extensive
 # use of enums which are often type casted to unsigned ints.
 LOCAL_CFLAGS := \
-    -Wno-empty-body \
-    -Wno-strict-aliasing \
-    -Wno-pointer-arith \
-    -Wno-maybe-uninitialized \
-    -Wno-uninitialized \
-    -Wno-implicit-function-declaration \
-    -Wno-enum-compare \
 	-fPIC -DPIC -D_POSIX_SOURCE \
 	-DALSA_CONFIG_DIR=\"/system/usr/share/alsa\" \
 	-DALSA_PLUGIN_DIR=\"/system/usr/lib/alsa-lib\" \
