@@ -18,6 +18,7 @@
  *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  *
  */
+#define HAVE_ENDIAN_H 1
 
 #include "local.h"
 
@@ -56,7 +57,7 @@ typedef struct _snd_ctl_ops {
 
 
 struct _snd_ctl {
-	void *dl_handle;
+	void *open_func;
 	char *name;
 	snd_ctl_type_t type;
 	const snd_ctl_ops_t *ops;
@@ -80,7 +81,7 @@ struct _snd_hctl_elem {
 struct _snd_hctl {
 	snd_ctl_t *ctl;
 	struct list_head elems;		/* list of all controls */
-	unsigned int alloc;	
+	unsigned int alloc;
 	unsigned int count;
 	snd_hctl_elem_t **pelems;
 	snd_hctl_compare_t compare;
@@ -98,3 +99,5 @@ int _snd_ctl_poll_descriptor(snd_ctl_t *ctl);
 int snd_ctl_hw_open(snd_ctl_t **handle, const char *name, int card, int mode);
 int snd_ctl_shm_open(snd_ctl_t **handlep, const char *name, const char *sockname, const char *sname, int mode);
 int snd_ctl_async(snd_ctl_t *ctl, int sig, pid_t pid);
+
+#define CTLINABORT(x) ((x)->nonblock == 2)

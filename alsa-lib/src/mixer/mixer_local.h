@@ -19,6 +19,7 @@
  *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  *
  */
+#define HAVE_ENDIAN_H 1
 
 #include "local.h"
 
@@ -46,7 +47,7 @@ struct _snd_mixer_class {
 	struct list_head list;
 	snd_mixer_t *mixer;
 	snd_mixer_event_t event;
-	void *private_data;		
+	void *private_data;
 	void (*private_free)(snd_mixer_class_t *class);
 	snd_mixer_compare_t compare;
 };

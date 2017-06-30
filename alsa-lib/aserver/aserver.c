@@ -93,6 +93,7 @@ static int make_inet_socket(int port)
 		return result;
 	}
 	
+	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
 	addr.sin_port = htons(port);
 	addr.sin_addr.s_addr = INADDR_ANY;
@@ -1013,11 +1014,10 @@ int main(int argc, char **argv)
 	snd_config_t *conf;
 	snd_config_iterator_t i, next;
 	const char *sockname = NULL;
-	const char *host = NULL;
 	long port = -1;
 	int err;
 	char *srvname;
-	struct hostent *h;
+
 	command = argv[0];
 	while ((c = getopt_long(argc, argv, "h", long_options, 0)) != -1) {
 		switch (c) {
@@ -1055,14 +1055,8 @@ int main(int argc, char **argv)
 			continue;
 		if (strcmp(id, "comment") == 0)
 			continue;
-		if (strcmp(id, "host") == 0) {
-			err = snd_config_get_string(n, &host);
-			if (err < 0) {
-				ERROR("Invalid type for %s", id);
-				return 1;
-			}
+		if (strcmp(id, "host") == 0)
 			continue;
-		}
 		if (strcmp(id, "socket") == 0) {
 			err = snd_config_get_string(n, &sockname);
 			if (err < 0) {
@@ -1080,19 +1074,6 @@ int main(int argc, char **argv)
 			continue;
 		}
 		ERROR("Unknown field %s", id);
-		return 1;
-	}
-	if (!host) {
-		ERROR("host is not defined");
-		return 1;
-	}
-	h = gethostbyname(host);
-	if (!h) {
-		ERROR("Cannot resolve %s", host);
-		return 1;
-	}
-	if (!snd_is_local(h)) {
-		ERROR("%s is not the local host", host);
 		return 1;
 	}
 	if (!sockname && port < 0) {

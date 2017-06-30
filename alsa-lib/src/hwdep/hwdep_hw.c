@@ -18,6 +18,7 @@
  *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  *
  */
+#define SND_MAX_CARDS 32
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -111,8 +112,8 @@ int snd_hwdep_hw_open(snd_hwdep_t **handle, const char *name, int card, int devi
 	assert(handle);
 
 	*handle = NULL;
-	
-	if (card < 0 || card >= 32)
+
+	if (card < 0 || card >= SND_MAX_CARDS)
 		return -EINVAL;
 	sprintf(filename, SNDRV_FILE_HWDEP, card, device);
 	fd = snd_open_device(filename, mode);
@@ -158,9 +159,7 @@ int _snd_hwdep_hw_open(snd_hwdep_t **hwdep, char *name,
 		const char *id;
 		if (snd_config_get_id(n, &id) < 0)
 			continue;
-		if (strcmp(id, "comment") == 0)
-			continue;
-		if (strcmp(id, "type") == 0)
+		if (_snd_conf_generic_id(id))
 			continue;
 		if (strcmp(id, "card") == 0) {
 			err = snd_config_get_integer(n, &card);

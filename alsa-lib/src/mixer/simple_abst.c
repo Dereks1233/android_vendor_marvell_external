@@ -70,6 +70,8 @@ static int try_open(snd_mixer_class_t *class, const char *lib)
 	void *h;
 	int err = 0;
 
+	if (!lib)
+		return -ENXIO;
 	path = getenv("ALSA_MIXER_SIMPLE_MODULES");
 	if (!path)
 		path = SO_PATH;
@@ -242,7 +244,7 @@ static int find_module(snd_mixer_class_t *class, snd_config_t *top)
 static void private_free(snd_mixer_class_t *class)
 {
 	class_priv_t *priv = snd_mixer_class_get_private(class);
-	
+
 	if (priv->private_free)
 		priv->private_free(class);
 	if (priv->dlhandle)
@@ -297,8 +299,18 @@ int snd_mixer_simple_basic_register(snd_mixer_t *mixer,
 	snd_mixer_class_set_private(class, priv);
 	snd_mixer_class_set_private_free(class, private_free);
 	file = getenv("ALSA_MIXER_SIMPLE");
-	if (!file)
-		file = ALSA_CONFIG_DIR "/smixer.conf";
+	if (!file) {
+		const char *topdir;
+		if (!topdir) {
+			topdir = getenv("ALSA_CONFIG_DIR");
+			if (!topdir || *topdir != '/' || strlen(topdir) >= PATH_MAX)
+				topdir = ALSA_CONFIG_DIR;
+		}
+
+		char *s = alloca(strlen(topdir) + strlen("smixer.conf") + 2);
+		sprintf(s, "%s/smixer.conf", topdir);
+		file = s;
+	}
 	err = snd_config_top(&top);
 	if (err >= 0) {
 		err = snd_input_stdio_open(&input, file, "r");

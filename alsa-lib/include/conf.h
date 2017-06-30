@@ -84,6 +84,8 @@ typedef struct _snd_config_update snd_config_update_t;
 
 extern snd_config_t *snd_config;
 
+const char *snd_config_topdir(void);
+
 int snd_config_top(snd_config_t **config);
 
 int snd_config_load(snd_config_t *config, snd_input_t *in);
@@ -93,6 +95,10 @@ int snd_config_update(void);
 int snd_config_update_r(snd_config_t **top, snd_config_update_t **update, const char *path);
 int snd_config_update_free(snd_config_update_t *update);
 int snd_config_update_free_global(void);
+
+int snd_config_update_ref(snd_config_t **top);
+void snd_config_ref(snd_config_t *top);
+void snd_config_unref(snd_config_t *top);
 
 int snd_config_search(snd_config_t *config, const char *key,
 		      snd_config_t **result);
@@ -126,6 +132,7 @@ int snd_config_imake_integer(snd_config_t **config, const char *key, const long 
 int snd_config_imake_integer64(snd_config_t **config, const char *key, const long long value);
 int snd_config_imake_real(snd_config_t **config, const char *key, const double value);
 int snd_config_imake_string(snd_config_t **config, const char *key, const char *ascii);
+int snd_config_imake_safe_string(snd_config_t **config, const char *key, const char *ascii);
 int snd_config_imake_pointer(snd_config_t **config, const char *key, const void *ptr);
 
 snd_config_type_t snd_config_get_type(const snd_config_t *config);

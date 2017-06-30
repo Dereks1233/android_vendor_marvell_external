@@ -140,10 +140,13 @@ int snd_tlv_get_dB_range(unsigned int *tlv, long rangemin, long rangemax,
 		pos = 2;
 		while (pos + 4 <= len) {
 			long rmin, rmax;
-			rangemin = (int)tlv[pos];
-			rangemax = (int)tlv[pos + 1];
+			long submin, submax;
+			submin = (int)tlv[pos];
+			submax = (int)tlv[pos + 1];
+			if (rangemax < submax)
+				submax = rangemax;
 			err = snd_tlv_get_dB_range(tlv + pos + 2,
-						   rangemin, rangemax,
+						   submin, submax,
 						   &rmin, &rmax);
 			if (err < 0)
 				return err;
@@ -156,21 +159,29 @@ int snd_tlv_get_dB_range(unsigned int *tlv, long rangemin, long rangemax,
 				*min = rmin;
 				*max = rmax;
 			}
+			if (rangemax == submax)
+				return 0;
 			pos += int_index(tlv[pos + 3]) + 4;
 		}
 		return 0;
 	}
 	case SND_CTL_TLVT_DB_SCALE: {
 		int step;
-		*min = (int)tlv[2];
+		if (tlv[3] & 0x10000)
+			*min = SND_CTL_TLV_DB_GAIN_MUTE;
+		else
+			*min = (int)tlv[2];
 		step = (tlv[3] & 0xffff);
-		*max = *min + (long)(step * (rangemax - rangemin));
+		*max = (int)tlv[2] + step * (rangemax - rangemin);
 		return 0;
 	}
 	case SND_CTL_TLVT_DB_MINMAX:
-	case SND_CTL_TLVT_DB_MINMAX_MUTE:
 	case SND_CTL_TLVT_DB_LINEAR:
 		*min = (int)tlv[2];
+		*max = (int)tlv[3];
+		return 0;
+	case SND_CTL_TLVT_DB_MINMAX_MUTE:
+		*min = SND_CTL_TLV_DB_GAIN_MUTE;
 		*max = (int)tlv[3];
 		return 0;
 	}
@@ -212,7 +223,7 @@ int snd_tlv_convert_to_dB(unsigned int *tlv, long rangemin, long rangemax,
 		min = tlv[2];
 		step = (tlv[3] & 0xffff);
 		mute = (tlv[3] >> 16) & 1;
-		if (mute && volume == rangemin)
+		if (mute && volume <= rangemin)
 			*db_gain = SND_CTL_TLV_DB_GAIN_MUTE;
 		else
 			*db_gain = (volume - rangemin) * step + min;
@@ -280,25 +291,37 @@ int snd_tlv_convert_from_dB(unsigned int *tlv, long rangemin, long rangemax,
 {
 	switch (tlv[0]) {
 	case SND_CTL_TLVT_DB_RANGE: {
+		long dbmin, dbmax, prev_submax;
 		unsigned int pos, len;
 		len = int_index(tlv[1]);
-		if (len > MAX_TLV_RANGE_SIZE)
+		if (len < 6 || len > MAX_TLV_RANGE_SIZE)
 			return -EINVAL;
 		pos = 2;
+		prev_submax = 0;
 		while (pos + 4 <= len) {
-			long dbmin, dbmax;
-			rangemin = (int)tlv[pos];
-			rangemax = (int)tlv[pos + 1];
+			long submin, submax;
+			submin = (int)tlv[pos];
+			submax = (int)tlv[pos + 1];
+			if (rangemax < submax)
+				submax = rangemax;
 			if (!snd_tlv_get_dB_range(tlv + pos + 2,
-						  rangemin, rangemax,
+						  submin, submax,
 						  &dbmin, &dbmax) &&
 			    db_gain >= dbmin && db_gain <= dbmax)
 				return snd_tlv_convert_from_dB(tlv + pos + 2,
-							       rangemin, rangemax,
+							       submin, submax,
 							       db_gain, value, xdir);
+			else if (db_gain < dbmin) {
+				*value = xdir > 0 || pos == 2 ? submin : prev_submax;
+				return 0;
+			}
+			prev_submax = submax;
+			if (rangemax == submax)
+				break;
 			pos += int_index(tlv[pos + 3]) + 4;
 		}
-		return -EINVAL;
+		*value = prev_submax;
+		return 0;
 	}
 	case SND_CTL_TLVT_DB_SCALE: {
 		int min, step, max;
@@ -306,7 +329,11 @@ int snd_tlv_convert_from_dB(unsigned int *tlv, long rangemin, long rangemax,
 		step = (tlv[3] & 0xffff);
 		max = min + (int)(step * (rangemax - rangemin));
 		if (db_gain <= min)
-			*value = rangemin;
+			if (db_gain > SND_CTL_TLV_DB_GAIN_MUTE && xdir > 0 &&
+			    (tlv[3] & 0x10000))
+				*value = rangemin + 1;
+			else
+				*value = rangemin;
 		else if (db_gain >= max)
 			*value = rangemax;
 		else {
@@ -324,7 +351,11 @@ int snd_tlv_convert_from_dB(unsigned int *tlv, long rangemin, long rangemax,
 		min = tlv[2];
 		max = tlv[3];
 		if (db_gain <= min)
-			*value = rangemin;
+			if (db_gain > SND_CTL_TLV_DB_GAIN_MUTE && xdir > 0 &&
+			    tlv[0] == SND_CTL_TLVT_DB_MINMAX_MUTE)
+				*value = rangemin + 1;
+			else
+				*value = rangemin;
 		else if (db_gain >= max)
 			*value = rangemax;
 		else {
@@ -378,20 +409,19 @@ struct tlv_info {
 static int get_tlv_info(snd_ctl_t *ctl, const snd_ctl_elem_id_t *id,
 			struct tlv_info *rec)
 {
-	snd_ctl_elem_info_t *info;
+	snd_ctl_elem_info_t info = {0};
 	int err;
 
-	snd_ctl_elem_info_alloca(&info);
-	snd_ctl_elem_info_set_id(info, id);
-	err = snd_ctl_elem_info(ctl, info);
+	snd_ctl_elem_info_set_id(&info, id);
+	err = snd_ctl_elem_info(ctl, &info);
 	if (err < 0)
 		return err;
-	if (!snd_ctl_elem_info_is_tlv_readable(info))
+	if (!snd_ctl_elem_info_is_tlv_readable(&info))
 		return -EINVAL;
-	if (snd_ctl_elem_info_get_type(info) != SND_CTL_ELEM_TYPE_INTEGER)
+	if (snd_ctl_elem_info_get_type(&info) != SND_CTL_ELEM_TYPE_INTEGER)
 		return -EINVAL;
-	rec->minval = snd_ctl_elem_info_get_min(info);
-	rec->maxval = snd_ctl_elem_info_get_max(info);
+	rec->minval = snd_ctl_elem_info_get_min(&info);
+	rec->maxval = snd_ctl_elem_info_get_max(&info);
 	err = snd_ctl_elem_tlv_read(ctl, id, rec->buf, sizeof(rec->buf));
 	if (err < 0)
 		return err;
@@ -421,7 +451,7 @@ int snd_ctl_get_dB_range(snd_ctl_t *ctl, const snd_ctl_elem_id_t *id,
 	return snd_tlv_get_dB_range(info.tlv, info.minval, info.maxval,
 				    min, max);
 }
-	
+
 /**
  * \brief Convert the volume value to dB on the given control element
  * \param ctl the control handler

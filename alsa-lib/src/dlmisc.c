@@ -26,10 +26,13 @@
  *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  *
  */
+#define HAVE_ENDIAN_H 1
 
-#define _GNU_SOURCE
 #include "list.h"
 #include "local.h"
+#ifdef HAVE_LIBPTHREAD
+#include <pthread.h>
+#endif
 
 #ifndef DOC_HIDDEN
 #ifndef PIC
@@ -54,18 +57,36 @@ void *snd_dlopen(const char *name, int mode)
 #else
 #ifdef HAVE_LIBDL
 	if (name == NULL) {
-#ifdef ANDROID
-		return RTLD_DEFAULT;
-#else
-		Dl_info dlinfo;
-		if (dladdr(snd_dlopen, &dlinfo) > 0)
-			name = dlinfo.dli_fname;
-#endif
+		static const char * self = NULL;
+		if (self == NULL) {
+			Dl_info dlinfo;
+			if (dladdr(snd_dlopen, &dlinfo) > 0)
+				self = dlinfo.dli_fname;
+		}
+		name = self;
 	}
 #endif
 #endif
 #ifdef HAVE_LIBDL
-	return dlopen(name, mode);
+	/*
+	 * Handle the plugin dir not being on the default dlopen search
+	 * path, without resorting to polluting the entire system namespace
+	 * via ld.so.conf.
+	 */
+	void *handle = NULL;
+	char *filename;
+
+	if (name && name[0] != '/') {
+		filename = malloc(sizeof(ALSA_PLUGIN_DIR) + 1 + strlen(name) + 1);
+		strcpy(filename, ALSA_PLUGIN_DIR);
+		strcat(filename, "/");
+		strcat(filename, name);
+		handle = dlopen(filename, mode);
+		free(filename);
+	}
+	if (!handle)
+		handle = dlopen(name, mode);
+	return handle;
 #else
 	return NULL;
 #endif
@@ -86,10 +107,6 @@ int snd_dlclose(void *handle)
 		return 0;
 #endif
 #ifdef HAVE_LIBDL
-#ifdef ANDROID
-	if (handle == RTLD_DEFAULT)
-		return 0;
-#endif
 	return dlclose(handle);
 #else
 	return 0;
@@ -111,7 +128,7 @@ static int snd_dlsym_verify(void *handle, const char *name, const char *version)
 #ifdef HAVE_LIBDL
 	int res;
 	char *vname;
-	
+
 	if (handle == NULL)
 		return -EINVAL;
 	vname = alloca(1 + strlen(name) + strlen(version) + 1);
@@ -161,11 +178,13 @@ void *snd_dlsym(void *handle, const char *name, const char *version)
 	}
 #endif
 #ifdef HAVE_LIBDL
+#ifdef VERSIONED_SYMBOLS
 	if (version) {
 		err = snd_dlsym_verify(handle, name, version);
 		if (err < 0)
 			return NULL;
 	}
+#endif
 	return dlsym(handle, name);
 #else
 	return NULL;
@@ -174,69 +193,140 @@ void *snd_dlsym(void *handle, const char *name, const char *version)
 
 /*
  * dlobj cache
- *
- * FIXME: add reference counter and proper locking
  */
 
 #ifndef DOC_HIDDEN
 struct dlobj_cache {
+	const char *lib;
 	const char *name;
-	void *obj;
+	void *dlobj;
 	void *func;
+	unsigned int refcnt;
 	struct list_head list;
 };
 
-static LIST_HEAD(pcm_dlobj_list);
+#ifdef HAVE_LIBPTHREAD
+static pthread_mutex_t snd_dlobj_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-void *snd_dlobj_cache_lookup(const char *name)
+static inline void snd_dlobj_lock(void)
 {
-	struct list_head *p;
-	struct dlobj_cache *c;
-
-	list_for_each(p, &pcm_dlobj_list) {
-		c = list_entry(p, struct dlobj_cache, list);
-		if (strcmp(c->name, name) == 0)
-			return c->func;
-	}
-	return NULL;
+	pthread_mutex_lock(&snd_dlobj_mutex);
 }
 
-int snd_dlobj_cache_add(const char *name, void *dlobj, void *open_func)
+static inline void snd_dlobj_unlock(void)
+{
+	pthread_mutex_unlock(&snd_dlobj_mutex);
+}
+#else
+static inline void snd_dlobj_lock(void) {}
+static inline void snd_dlobj_unlock(void) {}
+#endif
+
+static LIST_HEAD(pcm_dlobj_list);
+
+void *snd_dlobj_cache_get(const char *lib, const char *name,
+			  const char *version, int verbose)
 {
 	struct list_head *p;
 	struct dlobj_cache *c;
+	void *func, *dlobj;
 
+	snd_dlobj_lock();
 	list_for_each(p, &pcm_dlobj_list) {
 		c = list_entry(p, struct dlobj_cache, list);
-		if (strcmp(c->name, name) == 0)
-			return 0; /* already exists */
+		if (c->lib && lib && strcmp(c->lib, lib) != 0)
+			continue;
+		if (!c->lib && lib)
+			continue;
+		if (!lib && c->lib)
+			continue;
+		if (strcmp(c->name, name) == 0) {
+			c->refcnt++;
+			func = c->func;
+			snd_dlobj_unlock();
+			return func;
+		}
+	}
+
+	dlobj = snd_dlopen(lib, RTLD_NOW);
+	if (dlobj == NULL) {
+		if (verbose)
+			SNDERR("Cannot open shared library %s",
+						lib ? lib : "[builtin]");
+		snd_dlobj_unlock();
+		return NULL;
+	}
+
+	func = snd_dlsym(dlobj, name, version);
+	if (func == NULL) {
+		if (verbose)
+			SNDERR("symbol %s is not defined inside %s",
+					name, lib ? lib : "[builtin]");
+		goto __err;
 	}
 	c = malloc(sizeof(*c));
 	if (! c)
-		return -ENOMEM;
+		goto __err;
+	c->refcnt = 1;
+	c->lib = lib ? strdup(lib) : NULL;
 	c->name = strdup(name);
-	if (! c->name) {
+	if ((lib && ! c->lib) || ! c->name) {
+		free((void *)c->name);
+		free((void *)c->lib);
 		free(c);
-		return -ENOMEM;
+	      __err:
+		snd_dlclose(dlobj);
+		snd_dlobj_unlock();
+		return NULL;
 	}
-	c->obj = dlobj;
-	c->func = open_func;
+	c->dlobj = dlobj;
+	c->func = func;
 	list_add_tail(&c->list, &pcm_dlobj_list);
-	return 0;
+	snd_dlobj_unlock();
+	return func;
+}
+
+int snd_dlobj_cache_put(void *func)
+{
+	struct list_head *p;
+	struct dlobj_cache *c;
+	unsigned int refcnt;
+
+	if (!func)
+		return -ENOENT;
+
+	snd_dlobj_lock();
+	list_for_each(p, &pcm_dlobj_list) {
+		c = list_entry(p, struct dlobj_cache, list);
+		if (c->func == func) {
+			refcnt = c->refcnt;
+			if (c->refcnt > 0)
+				c->refcnt--;
+			snd_dlobj_unlock();
+			return refcnt == 1 ? 0 : -EINVAL;
+		}
+	}
+	snd_dlobj_unlock();
+	return -ENOENT;
 }
 
 void snd_dlobj_cache_cleanup(void)
 {
-	struct list_head *p;
+	struct list_head *p, *npos;
 	struct dlobj_cache *c;
 
-	while (! list_empty(&pcm_dlobj_list)) {
-		p = pcm_dlobj_list.next;
+	snd_dlobj_lock();
+	list_for_each_safe(p, npos, &pcm_dlobj_list) {
 		c = list_entry(p, struct dlobj_cache, list);
+		if (c->refcnt)
+			continue;
 		list_del(p);
-		snd_dlclose(c->obj);
+		snd_dlclose(c->dlobj);
 		free((void *)c->name); /* shut up gcc warning */
+		free((void *)c->lib); /* shut up gcc warning */
 		free(c);
 	}
+
+	snd_dlobj_unlock();
 }
 #endif

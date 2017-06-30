@@ -24,13 +24,21 @@
 #include <stdlib.h>
 #include <limits.h>
 #include <sys/uio.h>
+#include <time.h>
+#include <sys/time.h>
 
 #define _snd_mask sndrv_mask
 #define _snd_pcm_access_mask _snd_mask
 #define _snd_pcm_format_mask _snd_mask
 #define _snd_pcm_subformat_mask _snd_mask
+#define HAVE_ENDIAN_H 1
 
 #include "local.h"
+
+#ifdef THREAD_SAFE_API
+#define __USE_UNIX98 1	/* for old glibc */
+#include <pthread.h>
+#endif
 
 #define SND_INTERVAL_INLINE
 #include "interval.h"
@@ -38,7 +46,6 @@
 #define SND_MASK_INLINE
 #include "mask.h"
 
-typedef enum sndrv_pcm_hw_param snd_pcm_hw_param_t;
 #define SND_PCM_HW_PARAM_ACCESS SNDRV_PCM_HW_PARAM_ACCESS
 #define SND_PCM_HW_PARAM_FIRST_MASK SNDRV_PCM_HW_PARAM_FIRST_MASK
 #define SND_PCM_HW_PARAM_FORMAT SNDRV_PCM_HW_PARAM_FORMAT
@@ -91,9 +98,12 @@ typedef enum sndrv_pcm_hw_param snd_pcm_hw_param_t;
 #define SND_PCM_INFO_JOINT_DUPLEX SNDRV_PCM_INFO_JOINT_DUPLEX
 /** device can do a kind of synchronized start */
 #define SND_PCM_INFO_SYNC_START SNDRV_PCM_INFO_SYNC_START
+/** device can disable period wakeups */
+#define SND_PCM_INFO_NO_PERIOD_WAKEUP SNDRV_PCM_INFO_NO_PERIOD_WAKEUP
 
 #define SND_PCM_HW_PARAMS_NORESAMPLE SNDRV_PCM_HW_PARAMS_NORESAMPLE
 #define SND_PCM_HW_PARAMS_EXPORT_BUFFER SNDRV_PCM_HW_PARAMS_EXPORT_BUFFER
+#define SND_PCM_HW_PARAMS_NO_PERIOD_WAKEUP SNDRV_PCM_HW_PARAMS_NO_PERIOD_WAKEUP
 
 #define SND_PCM_INFO_MONOTONIC	0x80000000
 
@@ -129,61 +139,66 @@ typedef struct _snd_pcm_channel_info {
 
 typedef struct {
 	int (*close)(snd_pcm_t *pcm);
-	int (*nonblock)(snd_pcm_t *pcm, int nonblock);
+	int (*nonblock)(snd_pcm_t *pcm, int nonblock); /* always locked */
 	int (*async)(snd_pcm_t *pcm, int sig, pid_t pid);
 	int (*info)(snd_pcm_t *pcm, snd_pcm_info_t *info);
 	int (*hw_refine)(snd_pcm_t *pcm, snd_pcm_hw_params_t *params);
 	int (*hw_params)(snd_pcm_t *pcm, snd_pcm_hw_params_t *params);
 	int (*hw_free)(snd_pcm_t *pcm);
-	int (*sw_params)(snd_pcm_t *pcm, snd_pcm_sw_params_t *params);
+	int (*sw_params)(snd_pcm_t *pcm, snd_pcm_sw_params_t *params); /* always locked */
 	int (*channel_info)(snd_pcm_t *pcm, snd_pcm_channel_info_t *info);
 	void (*dump)(snd_pcm_t *pcm, snd_output_t *out);
 	int (*mmap)(snd_pcm_t *pcm);
 	int (*munmap)(snd_pcm_t *pcm);
+	snd_pcm_chmap_query_t **(*query_chmaps)(snd_pcm_t *pcm);
+	snd_pcm_chmap_t *(*get_chmap)(snd_pcm_t *pcm);
+	int (*set_chmap)(snd_pcm_t *pcm, const snd_pcm_chmap_t *map);
 } snd_pcm_ops_t;
 
 typedef struct {
-	int (*status)(snd_pcm_t *pcm, snd_pcm_status_t *status);
-	int (*prepare)(snd_pcm_t *pcm);
-	int (*reset)(snd_pcm_t *pcm);
-	int (*start)(snd_pcm_t *pcm);
-	int (*drop)(snd_pcm_t *pcm);
-	int (*drain)(snd_pcm_t *pcm);
-	int (*pause)(snd_pcm_t *pcm, int enable);
-	snd_pcm_state_t (*state)(snd_pcm_t *pcm);
-	int (*hwsync)(snd_pcm_t *pcm);
-	int (*delay)(snd_pcm_t *pcm, snd_pcm_sframes_t *delayp);
-	int (*resume)(snd_pcm_t *pcm);
+	int (*status)(snd_pcm_t *pcm, snd_pcm_status_t *status); /* locked */
+	int (*prepare)(snd_pcm_t *pcm); /* locked */
+	int (*reset)(snd_pcm_t *pcm); /* locked */
+	int (*start)(snd_pcm_t *pcm); /* locked */
+	int (*drop)(snd_pcm_t *pcm); /* locked */
+	int (*drain)(snd_pcm_t *pcm); /* need own locking */
+	int (*pause)(snd_pcm_t *pcm, int enable); /* locked */
+	snd_pcm_state_t (*state)(snd_pcm_t *pcm); /* locked */
+	int (*hwsync)(snd_pcm_t *pcm); /* locked */
+	int (*delay)(snd_pcm_t *pcm, snd_pcm_sframes_t *delayp); /* locked */
+	int (*resume)(snd_pcm_t *pcm); /* need own locking */
 	int (*link)(snd_pcm_t *pcm1, snd_pcm_t *pcm2);
 	int (*link_slaves)(snd_pcm_t *pcm, snd_pcm_t *master);
 	int (*unlink)(snd_pcm_t *pcm);
-	snd_pcm_sframes_t (*rewindable)(snd_pcm_t *pcm);
-	snd_pcm_sframes_t (*rewind)(snd_pcm_t *pcm, snd_pcm_uframes_t frames);
-	snd_pcm_sframes_t (*forwardable)(snd_pcm_t *pcm);
-	snd_pcm_sframes_t (*forward)(snd_pcm_t *pcm, snd_pcm_uframes_t frames);
-	snd_pcm_sframes_t (*writei)(snd_pcm_t *pcm, const void *buffer, snd_pcm_uframes_t size);
-	snd_pcm_sframes_t (*writen)(snd_pcm_t *pcm, void **bufs, snd_pcm_uframes_t size);
-	snd_pcm_sframes_t (*readi)(snd_pcm_t *pcm, void *buffer, snd_pcm_uframes_t size);
-	snd_pcm_sframes_t (*readn)(snd_pcm_t *pcm, void **bufs, snd_pcm_uframes_t size);
-	snd_pcm_sframes_t (*avail_update)(snd_pcm_t *pcm);
-	snd_pcm_sframes_t (*mmap_commit)(snd_pcm_t *pcm, snd_pcm_uframes_t offset, snd_pcm_uframes_t size);
-	int (*htimestamp)(snd_pcm_t *pcm, snd_pcm_uframes_t *avail, snd_htimestamp_t *tstamp);
-	int (*poll_descriptors_count)(snd_pcm_t *pcm);
-	int (*poll_descriptors)(snd_pcm_t *pcm, struct pollfd *pfds, unsigned int space);
-	int (*poll_revents)(snd_pcm_t *pcm, struct pollfd *pfds, unsigned int nfds, unsigned short *revents);
+	snd_pcm_sframes_t (*rewindable)(snd_pcm_t *pcm); /* locked */
+	snd_pcm_sframes_t (*rewind)(snd_pcm_t *pcm, snd_pcm_uframes_t frames); /* locked */
+	snd_pcm_sframes_t (*forwardable)(snd_pcm_t *pcm); /* locked */
+	snd_pcm_sframes_t (*forward)(snd_pcm_t *pcm, snd_pcm_uframes_t frames); /* locked */
+	snd_pcm_sframes_t (*writei)(snd_pcm_t *pcm, const void *buffer, snd_pcm_uframes_t size); /* need own locking */
+	snd_pcm_sframes_t (*writen)(snd_pcm_t *pcm, void **bufs, snd_pcm_uframes_t size); /* need own locking */
+	snd_pcm_sframes_t (*readi)(snd_pcm_t *pcm, void *buffer, snd_pcm_uframes_t size); /* need own locking */
+	snd_pcm_sframes_t (*readn)(snd_pcm_t *pcm, void **bufs, snd_pcm_uframes_t size); /* need own locking */
+	snd_pcm_sframes_t (*avail_update)(snd_pcm_t *pcm); /* locked */
+	snd_pcm_sframes_t (*mmap_commit)(snd_pcm_t *pcm, snd_pcm_uframes_t offset, snd_pcm_uframes_t size); /* locked */
+	int (*htimestamp)(snd_pcm_t *pcm, snd_pcm_uframes_t *avail, snd_htimestamp_t *tstamp); /* locked */
+	int (*poll_descriptors_count)(snd_pcm_t *pcm); /* locked */
+	int (*poll_descriptors)(snd_pcm_t *pcm, struct pollfd *pfds, unsigned int space); /* locked */
+	int (*poll_revents)(snd_pcm_t *pcm, struct pollfd *pfds, unsigned int nfds, unsigned short *revents); /* locked */
+	int (*may_wait_for_avail_min)(snd_pcm_t *pcm, snd_pcm_uframes_t avail);
 } snd_pcm_fast_ops_t;
 
 struct _snd_pcm {
-	void *dl_handle;
+	void *open_func;
 	char *name;
 	snd_pcm_type_t type;
 	snd_pcm_stream_t stream;
 	int mode;
+	long minperiodtime;		/* in us */
 	int poll_fd_count;
 	int poll_fd;
 	unsigned short poll_events;
 	int setup: 1,
-	    monotonic: 1;
+	    compat: 1;
 	snd_pcm_access_t access;	/* access mode */
 	snd_pcm_format_t format;	/* SND_PCM_FORMAT_* */
 	snd_pcm_subformat_t subformat;	/* subformat */
@@ -193,6 +208,7 @@ struct _snd_pcm {
 	unsigned int period_time;	/* period duration */
 	snd_interval_t periods;
 	snd_pcm_tstamp_t tstamp_mode;	/* timestamp mode */
+	snd_pcm_tstamp_type_t tstamp_type;	/* timestamp type */
 	unsigned int period_step;
 	snd_pcm_uframes_t avail_min;	/* min avail frames for wakeup */
 	int period_event;
@@ -220,6 +236,7 @@ struct _snd_pcm {
 					 * use the mmaped buffer of the slave
 					 */
 	unsigned int donot_close: 1;	/* don't close this PCM */
+	unsigned int own_state_check:1; /* plugin has own PCM state check */
 	snd_pcm_channel_info_t *mmap_channels;
 	snd_pcm_channel_area_t *running_areas;
 	snd_pcm_channel_area_t *stopped_areas;
@@ -229,6 +246,15 @@ struct _snd_pcm {
 	snd_pcm_t *fast_op_arg;
 	void *private_data;
 	struct list_head async_handlers;
+#ifdef THREAD_SAFE_API
+	int need_lock;		/* true = this PCM (plugin) is thread-unsafe,
+				 * thus it needs a lock.
+				 */
+	int lock_enabled;	/* thread-safety lock is enabled on the system;
+				 * it's set depending on $LIBASOUND_THREAD_SAFE.
+				 */
+	pthread_mutex_t lock;
+#endif
 };
 
 /* make local functions really local */
@@ -252,8 +278,6 @@ struct _snd_pcm {
 	snd1_pcm_areas_from_bufs
 #define snd_pcm_open_named_slave \
 	snd1_pcm_open_named_slave
-#define snd_pcm_conf_generic_id \
-	snd1_pcm_conf_generic_id
 #define snd_pcm_hw_open_fd \
 	snd1_pcm_hw_open_fd
 #define snd_pcm_wait_nocheck \
@@ -369,9 +393,9 @@ snd_pcm_sframes_t snd_pcm_mmap_readi(snd_pcm_t *pcm, void *buffer, snd_pcm_ufram
 snd_pcm_sframes_t snd_pcm_mmap_writen(snd_pcm_t *pcm, void **bufs, snd_pcm_uframes_t size);
 snd_pcm_sframes_t snd_pcm_mmap_readn(snd_pcm_t *pcm, void **bufs, snd_pcm_uframes_t size);
 
-typedef snd_pcm_sframes_t (*snd_pcm_xfer_areas_func_t)(snd_pcm_t *pcm, 
+typedef snd_pcm_sframes_t (*snd_pcm_xfer_areas_func_t)(snd_pcm_t *pcm,
 						       const snd_pcm_channel_area_t *areas,
-						       snd_pcm_uframes_t offset, 
+						       snd_pcm_uframes_t offset,
 						       snd_pcm_uframes_t size);
 
 snd_pcm_sframes_t snd_pcm_read_areas(snd_pcm_t *pcm, const snd_pcm_channel_area_t *areas,
@@ -393,11 +417,44 @@ int _snd_pcm_poll_descriptor(snd_pcm_t *pcm);
 #define _snd_pcm_link_descriptor _snd_pcm_poll_descriptor /* FIXME */
 #define _snd_pcm_async_descriptor _snd_pcm_poll_descriptor /* FIXME */
 
+/* locked versions */
+int __snd_pcm_mmap_begin(snd_pcm_t *pcm, const snd_pcm_channel_area_t **areas,
+			 snd_pcm_uframes_t *offset, snd_pcm_uframes_t *frames);
+snd_pcm_sframes_t __snd_pcm_mmap_commit(snd_pcm_t *pcm,
+					snd_pcm_uframes_t offset,
+					snd_pcm_uframes_t frames);
+int __snd_pcm_wait_in_lock(snd_pcm_t *pcm, int timeout);
+
+static inline snd_pcm_sframes_t __snd_pcm_avail_update(snd_pcm_t *pcm)
+{
+	return pcm->fast_ops->avail_update(pcm->fast_op_arg);
+}
+
+static inline int __snd_pcm_start(snd_pcm_t *pcm)
+{
+	return pcm->fast_ops->start(pcm->fast_op_arg);
+}
+
+static inline snd_pcm_state_t __snd_pcm_state(snd_pcm_t *pcm)
+{
+	return pcm->fast_ops->state(pcm->fast_op_arg);
+}
+
+static inline int __snd_pcm_hwsync(snd_pcm_t *pcm)
+{
+	return pcm->fast_ops->hwsync(pcm->fast_op_arg);
+}
+
+static inline int __snd_pcm_delay(snd_pcm_t *pcm, snd_pcm_sframes_t *delayp)
+{
+	return pcm->fast_ops->delay(pcm->fast_op_arg, delayp);
+}
+
 /* handle special error cases */
 static inline int snd_pcm_check_error(snd_pcm_t *pcm, int err)
 {
 	if (err == -EINTR) {
-		switch (snd_pcm_state(pcm)) {
+		switch (__snd_pcm_state(pcm)) {
 		case SND_PCM_STATE_XRUN:
 			return -EPIPE;
 		case SND_PCM_STATE_SUSPENDED:
@@ -451,19 +508,31 @@ static inline snd_pcm_sframes_t snd_pcm_mmap_capture_hw_avail(snd_pcm_t *pcm)
 
 static inline snd_pcm_sframes_t snd_pcm_mmap_hw_avail(snd_pcm_t *pcm)
 {
-	snd_pcm_sframes_t avail;
-	avail = *pcm->hw.ptr - *pcm->appl.ptr;
-	if (pcm->stream == SND_PCM_STREAM_PLAYBACK)
-		avail += pcm->buffer_size;
-	if (avail < 0)
-		avail += pcm->boundary;
-	return pcm->buffer_size - avail;
+	return pcm->buffer_size - snd_pcm_mmap_avail(pcm);
+}
+
+static inline snd_pcm_sframes_t snd_pcm_mmap_playback_hw_rewindable(snd_pcm_t *pcm)
+{
+	snd_pcm_sframes_t ret = snd_pcm_mmap_playback_hw_avail(pcm);
+	return (ret >= 0) ? ret : 0;
+}
+
+static inline snd_pcm_sframes_t snd_pcm_mmap_capture_hw_rewindable(snd_pcm_t *pcm)
+{
+	snd_pcm_sframes_t ret = snd_pcm_mmap_capture_hw_avail(pcm);
+	return (ret >= 0) ? ret : 0;
+}
+
+static inline snd_pcm_uframes_t snd_pcm_mmap_hw_rewindable(snd_pcm_t *pcm)
+{
+	snd_pcm_sframes_t ret = snd_pcm_mmap_hw_avail(pcm);
+	return (ret >= 0) ? ret : 0;
 }
 
 static inline const snd_pcm_channel_area_t *snd_pcm_mmap_areas(snd_pcm_t *pcm)
 {
 	if (pcm->stopped_areas &&
-	    snd_pcm_state(pcm) != SND_PCM_STATE_RUNNING) 
+	    __snd_pcm_state(pcm) != SND_PCM_STATE_RUNNING)
 		return pcm->stopped_areas;
 	return pcm->running_areas;
 }
@@ -513,21 +582,25 @@ static inline unsigned int snd_pcm_channel_area_step(const snd_pcm_channel_area_
 
 static inline snd_pcm_sframes_t _snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_uframes_t size)
 {
+	/* lock handled in the callback */
 	return pcm->fast_ops->writei(pcm->fast_op_arg, buffer, size);
 }
 
 static inline snd_pcm_sframes_t _snd_pcm_writen(snd_pcm_t *pcm, void **bufs, snd_pcm_uframes_t size)
 {
+	/* lock handled in the callback */
 	return pcm->fast_ops->writen(pcm->fast_op_arg, bufs, size);
 }
 
 static inline snd_pcm_sframes_t _snd_pcm_readi(snd_pcm_t *pcm, void *buffer, snd_pcm_uframes_t size)
 {
+	/* lock handled in the callback */
 	return pcm->fast_ops->readi(pcm->fast_op_arg, buffer, size);
 }
 
 static inline snd_pcm_sframes_t _snd_pcm_readn(snd_pcm_t *pcm, void **bufs, snd_pcm_uframes_t size)
 {
+	/* lock handled in the callback */
 	return pcm->fast_ops->readn(pcm->fast_op_arg, bufs, size);
 }
 
@@ -569,7 +642,8 @@ static inline int muldiv_near(int a, int b, int c)
 }
 
 int snd_pcm_hw_refine(snd_pcm_t *pcm, snd_pcm_hw_params_t *params);
-int _snd_pcm_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t *params);
+int _snd_pcm_hw_params_internal(snd_pcm_t *pcm, snd_pcm_hw_params_t *params);
+#undef _snd_pcm_hw_params
 int snd_pcm_hw_refine_soft(snd_pcm_t *pcm, snd_pcm_hw_params_t *params);
 int snd_pcm_hw_refine_slave(snd_pcm_t *pcm, snd_pcm_hw_params_t *params,
 			    int (*cprepare)(snd_pcm_t *pcm,
@@ -859,7 +933,8 @@ snd_pcm_open_slave(snd_pcm_t **pcmp, snd_config_t *root,
 	return snd_pcm_open_named_slave(pcmp, NULL, root, conf, stream,
 					mode, parent_conf);
 }
-int snd_pcm_conf_generic_id(const char *id);
+
+#define snd_pcm_conf_generic_id(id) _snd_conf_generic_id(id)
 
 int snd_pcm_hw_open_fd(snd_pcm_t **pcmp, const char *name, int fd, int mmap_emulation, int sync_ptr_ioctl);
 int __snd_pcm_mmap_emul_open(snd_pcm_t **pcmp, const char *name,
@@ -929,7 +1004,7 @@ const snd_config_t *snd_pcm_rate_get_default_converter(snd_config_t *root);
 	 (1U << (SND_PCM_FORMAT_U18_3LE - 32)) | \
 	 (1U << (SND_PCM_FORMAT_S18_3BE - 32)) | \
 	 (1U << (SND_PCM_FORMAT_U18_3BE - 32))) }
-	
+
 
 #define SND_PCM_FMTBIT_FLOAT \
 	{ ((1U << SND_PCM_FORMAT_FLOAT_LE) | \
@@ -949,19 +1024,110 @@ typedef union snd_tmp_double {
 } snd_tmp_double_t;
 
 /* get the current timestamp */
-static inline void gettimestamp(snd_htimestamp_t *tstamp, int monotonic)
+#ifdef HAVE_CLOCK_GETTIME
+static inline void gettimestamp(snd_htimestamp_t *tstamp,
+				snd_pcm_tstamp_type_t tstamp_type)
 {
-#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
-	if (monotonic) {
-		clock_gettime(CLOCK_MONOTONIC, tstamp);
-	} else {
-#endif
-		struct timeval tv;
+	clockid_t id;
 
-		gettimeofday(&tv, 0);
-		tstamp->tv_sec = tv.tv_sec;
-		tstamp->tv_nsec = tv.tv_usec * 1000L;
-#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
-	}
+	switch (tstamp_type) {
+#ifdef CLOCK_MONOTONIC_RAW
+	case SND_PCM_TSTAMP_TYPE_MONOTONIC_RAW:
+		id = CLOCK_MONOTONIC_RAW;
+		break;
 #endif
+#ifdef CLOCK_MONOTONIC
+	case SND_PCM_TSTAMP_TYPE_MONOTONIC:
+		id = CLOCK_MONOTONIC;
+		break;
+#endif
+	default:
+		id = CLOCK_REALTIME;
+		break;
+	}
+	clock_gettime(id, tstamp);
 }
+#else /* HAVE_CLOCK_GETTIME */
+static inline void gettimestamp(snd_htimestamp_t *tstamp,
+				snd_pcm_tstamp_type_t tstamp_type)
+{
+	struct timeval tv;
+
+	gettimeofday(&tv, 0);
+	tstamp->tv_sec = tv.tv_sec;
+	tstamp->tv_nsec = tv.tv_usec * 1000L;
+}
+#endif /* HAVE_CLOCK_GETTIME */
+
+snd_pcm_chmap_query_t **
+_snd_pcm_make_single_query_chmaps(const snd_pcm_chmap_t *src);
+snd_pcm_chmap_t *_snd_pcm_copy_chmap(const snd_pcm_chmap_t *src);
+snd_pcm_chmap_query_t **
+_snd_pcm_copy_chmap_query(snd_pcm_chmap_query_t * const *src);
+snd_pcm_chmap_query_t **
+_snd_pcm_parse_config_chmaps(snd_config_t *conf);
+snd_pcm_chmap_t *
+_snd_pcm_choose_fixed_chmap(snd_pcm_t *pcm, snd_pcm_chmap_query_t * const *maps);
+
+/* return true if the PCM stream may wait to get avail_min space */
+static inline int snd_pcm_may_wait_for_avail_min(snd_pcm_t *pcm, snd_pcm_uframes_t avail)
+{
+	if (avail >= pcm->avail_min)
+		return 0;
+	if (pcm->fast_ops->may_wait_for_avail_min)
+		return pcm->fast_ops->may_wait_for_avail_min(pcm, avail);
+	return 1;
+}
+
+/* hack to access to internal period_event in snd_pcm_sw_parmams */
+static inline int sw_get_period_event(const snd_pcm_sw_params_t *params)
+{
+	return params->reserved[sizeof(params->reserved) / sizeof(params->reserved[0])- 1];
+}
+
+static inline void sw_set_period_event(snd_pcm_sw_params_t *params, int val)
+{
+	params->reserved[sizeof(params->reserved) / sizeof(params->reserved[0]) - 1] = val;
+}
+
+#define PCMINABORT(pcm) (((pcm)->mode & SND_PCM_ABORT) != 0)
+
+#ifdef THREAD_SAFE_API
+/*
+ * __snd_pcm_lock() and __snd_pcm_unlock() are used to lock/unlock the plugin
+ * forcibly even if it's declared as thread-safe.  It's needed only for some
+ * codes that are thread-unsafe per design (e.g. snd_pcm_nonblock()).
+ *
+ * OTOH, snd_pcm_lock() and snd_pcm_unlock() are used to lock/unlock the plugin
+ * in normal situations.  They do lock/unlock only when the plugin is
+ * thread-unsafe.
+ *
+ * Both __snd_pcm_lock() and snd_pcm_lock() (and their unlocks) wouldn't do
+ * any action when the whole locking is disabled via $LIBASOUND_THREAD_SAFE=0.
+ */
+static inline void __snd_pcm_lock(snd_pcm_t *pcm)
+{
+	if (pcm->lock_enabled)
+		pthread_mutex_lock(&pcm->lock);
+}
+static inline void __snd_pcm_unlock(snd_pcm_t *pcm)
+{
+	if (pcm->lock_enabled)
+		pthread_mutex_unlock(&pcm->lock);
+}
+static inline void snd_pcm_lock(snd_pcm_t *pcm)
+{
+	if (pcm->lock_enabled && pcm->need_lock)
+		pthread_mutex_lock(&pcm->lock);
+}
+static inline void snd_pcm_unlock(snd_pcm_t *pcm)
+{
+	if (pcm->lock_enabled && pcm->need_lock)
+		pthread_mutex_unlock(&pcm->lock);
+}
+#else /* THREAD_SAFE_API */
+#define __snd_pcm_lock(pcm)		do {} while (0)
+#define __snd_pcm_unlock(pcm)		do {} while (0)
+#define snd_pcm_lock(pcm)		do {} while (0)
+#define snd_pcm_unlock(pcm)		do {} while (0)
+#endif /* THREAD_SAFE_API */

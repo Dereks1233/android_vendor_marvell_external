@@ -4,6 +4,7 @@
  * \author Takashi Iwai <tiwai@suse.de>
  * \date 2001
  */
+#define HAVE_ENDIAN_H 1
 
 #include "local.h"
 
@@ -46,4 +47,3 @@ const unsigned int snd_seq_event_types[256] = {
 	[SND_SEQ_EVENT_NONE]
 	= FIXED_EV(SND_SEQ_EVFLG_NONE),
 };
-

@@ -3,6 +3,7 @@
  */
 
 #ifndef DOXYGEN
+#define HAVE_ENDIAN_H 1
 
 #include "local.h"
 

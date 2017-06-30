@@ -22,6 +22,7 @@
 
 #ifndef __SEQ_LOCAL_H
 #define __SEQ_LOCAL_H
+#define HAVE_ENDIAN_H 1
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,7 +33,7 @@
 #define SND_SEQ_IBUF_SIZE	500		/* in event_size aligned */
 #define DEFAULT_TMPBUF_SIZE	20
 
-typedef struct sndrv_seq_queue_client snd_seq_queue_client_t;
+typedef struct snd_seq_queue_client snd_seq_queue_client_t;
 
 
 typedef struct {

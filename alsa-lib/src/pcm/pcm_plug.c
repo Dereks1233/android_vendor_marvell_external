@@ -50,10 +50,10 @@ typedef struct {
 	snd_pcm_format_t sformat;
 	int schannels;
 	int srate;
-	const snd_config_t *rate_converter;
+	snd_config_t *rate_converter;
 	enum snd_pcm_plug_route_policy route_policy;
 	snd_pcm_route_ttable_entry_t *ttable;
-	int ttable_ok, ttable_last;
+	int ttable_ok;
 	unsigned int tt_ssize, tt_cused, tt_sused;
 } snd_pcm_plug_t;
 
@@ -64,6 +64,10 @@ static int snd_pcm_plug_close(snd_pcm_t *pcm)
 	snd_pcm_plug_t *plug = pcm->private_data;
 	int err, result = 0;
 	free(plug->ttable);
+	if (plug->rate_converter) {
+		snd_config_delete(plug->rate_converter);
+		plug->rate_converter = NULL;
+	}
 	assert(plug->gen.slave == plug->req_slave);
 	if (plug->gen.close_slave) {
 		snd_pcm_unlink_hw_ptr(pcm, plug->req_slave);
@@ -380,7 +384,7 @@ static int snd_pcm_plug_change_channels(snd_pcm_t *pcm, snd_pcm_t **new, snd_pcm
 	snd_pcm_route_ttable_entry_t *ttable;
 	int err;
 	if (clt->channels == slv->channels &&
-	    (!plug->ttable || !plug->ttable_last))
+	    (!plug->ttable || plug->ttable_ok))
 		return 0;
 	if (clt->rate != slv->rate &&
 	    clt->channels > slv->channels)
@@ -485,13 +489,15 @@ static int snd_pcm_plug_change_format(snd_pcm_t *pcm, snd_pcm_t **new, snd_pcm_p
 	/* No conversion is needed */
 	if (clt->format == slv->format &&
 	    clt->rate == slv->rate &&
-	    clt->channels == clt->channels)
+	    clt->channels == slv->channels &&
+	    (!plug->ttable || plug->ttable_ok))
 		return 0;
 
 	if (snd_pcm_format_linear(slv->format)) {
 		/* Conversion is done in another plugin */
 		if (clt->rate != slv->rate ||
-		    clt->channels != slv->channels)
+		    clt->channels != slv->channels ||
+		    (plug->ttable && !plug->ttable_ok))
 			return 0;
 		cfmt = clt->format;
 		switch (clt->format) {
@@ -522,15 +528,14 @@ static int snd_pcm_plug_change_format(snd_pcm_t *pcm, snd_pcm_t **new, snd_pcm_p
 		}
 #ifdef BUILD_PCM_PLUGIN_LFLOAT
 	} else if (snd_pcm_format_float(slv->format)) {
-		/* Conversion is done in another plugin */
-		if (clt->format == slv->format &&
-		    clt->rate == slv->rate &&
-		    clt->channels == slv->channels)
-			return 0;
-		cfmt = clt->format;
-		if (snd_pcm_format_linear(clt->format))
+		if (snd_pcm_format_linear(clt->format)) {
+			cfmt = clt->format;
 			f = snd_pcm_lfloat_open;
-		else
+		} else if (clt->rate != slv->rate || clt->channels != slv->channels ||
+			   (plug->ttable && !plug->ttable_ok)) {
+			cfmt = SND_PCM_FORMAT_S16;
+			f = snd_pcm_lfloat_open;
+		} else
 			return -EINVAL;
 #endif
 #ifdef BUILD_PCM_NONLINEAR
@@ -643,15 +648,18 @@ static int snd_pcm_plug_insert_plugins(snd_pcm_t *pcm,
 	};
 	snd_pcm_plug_params_t p = *slave;
 	unsigned int k = 0;
-	plug->ttable_ok = plug->ttable_last = 0;
+	plug->ttable_ok = 0;
 	while (client->format != p.format ||
 	       client->channels != p.channels ||
 	       client->rate != p.rate ||
-	       client->access != p.access) {
+	       client->access != p.access ||
+	       (plug->ttable && !plug->ttable_ok)) {
 		snd_pcm_t *new;
 		int err;
-		if (k >= sizeof(funcs)/sizeof(*funcs))
+		if (k >= sizeof(funcs)/sizeof(*funcs)) {
+			snd_pcm_plug_clear(pcm);
 			return -EINVAL;
+		}
 		err = funcs[k](pcm, &new, client, &p);
 		if (err < 0) {
 			snd_pcm_plug_clear(pcm);
@@ -659,29 +667,9 @@ static int snd_pcm_plug_insert_plugins(snd_pcm_t *pcm,
 		}
 		if (err) {
 			plug->gen.slave = new;
-			pcm->fast_ops = new->fast_ops;
-			pcm->fast_op_arg = new->fast_op_arg;
 		}
 		k++;
 	}
-#ifdef BUILD_PCM_PLUGIN_ROUTE
-	/* it's exception, user specified ttable, but no reduction/expand */
-	if (plug->ttable && !plug->ttable_ok) {
-		snd_pcm_t *new;
-		int err;
-		plug->ttable_last = 1;
-		err = snd_pcm_plug_change_channels(pcm, &new, client, &p);
-		if (err < 0) {
-			snd_pcm_plug_clear(pcm);
-			return err;
-		}
-		assert(err);
-		assert(plug->ttable_ok);
-		plug->gen.slave = new;
-		pcm->fast_ops = new->fast_ops;
-		pcm->fast_op_arg = new->fast_op_arg;
-	}
-#endif
 	return 0;
 }
 
@@ -1042,13 +1030,16 @@ static int snd_pcm_plug_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
 			return err;
 	}
 	slave = plug->gen.slave;
-	err = _snd_pcm_hw_params(slave, params);
+	err = _snd_pcm_hw_params_internal(slave, params);
 	if (err < 0) {
 		snd_pcm_plug_clear(pcm);
 		return err;
 	}
 	snd_pcm_unlink_hw_ptr(pcm, plug->req_slave);
 	snd_pcm_unlink_appl_ptr(pcm, plug->req_slave);
+
+	pcm->fast_ops = slave->fast_ops;
+	pcm->fast_op_arg = slave->fast_op_arg;
 	snd_pcm_link_hw_ptr(pcm, slave);
 	snd_pcm_link_appl_ptr(pcm, slave);
 	return 0;
@@ -1083,6 +1074,9 @@ static const snd_pcm_ops_t snd_pcm_plug_ops = {
 	.async = snd_pcm_generic_async,
 	.mmap = snd_pcm_generic_mmap,
 	.munmap = snd_pcm_generic_munmap,
+	.query_chmaps = snd_pcm_generic_query_chmaps,
+	.get_chmap = snd_pcm_generic_get_chmap,
+	.set_chmap = snd_pcm_generic_set_chmap,
 };
 
 /**
@@ -1118,7 +1112,6 @@ int snd_pcm_plug_open(snd_pcm_t **pcmp,
 	plug->sformat = sformat;
 	plug->schannels = schannels;
 	plug->srate = srate;
-	plug->rate_converter = rate_converter;
 	plug->gen.slave = plug->req_slave = slave;
 	plug->gen.close_slave = close_slave;
 	plug->route_policy = route_policy;
@@ -1135,11 +1128,20 @@ int snd_pcm_plug_open(snd_pcm_t **pcmp,
 	pcm->ops = &snd_pcm_plug_ops;
 	pcm->fast_ops = slave->fast_ops;
 	pcm->fast_op_arg = slave->fast_op_arg;
+	if (rate_converter) {
+		err = snd_config_copy(&plug->rate_converter,
+				      (snd_config_t *)rate_converter);
+		if (err < 0) {
+			snd_pcm_free(pcm);
+			free(plug);
+			return err;
+		}
+	}
 	pcm->private_data = plug;
 	pcm->poll_fd = slave->poll_fd;
 	pcm->poll_events = slave->poll_events;
 	pcm->mmap_shadow = 1;
-	pcm->monotonic = slave->monotonic;
+	pcm->tstamp_type = slave->tstamp_type;
 	snd_pcm_link_hw_ptr(pcm, slave);
 	snd_pcm_link_appl_ptr(pcm, slave);
 	*pcmp = pcm;

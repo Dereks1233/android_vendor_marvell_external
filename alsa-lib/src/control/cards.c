@@ -24,6 +24,7 @@
  *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  *
  */
+#define SND_MAX_CARDS 32
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -98,12 +99,12 @@ int snd_card_load(int card)
 int snd_card_next(int *rcard)
 {
 	int card;
-	
+
 	if (rcard == NULL)
 		return -EINVAL;
 	card = *rcard;
 	card = card < 0 ? 0 : card + 1;
-	for (; card < 32; card++) {
+	for (; card < SND_MAX_CARDS; card++) {
 		if (snd_card_load(card)) {
 			*rcard = card;
 			return 0;
@@ -134,7 +135,7 @@ int snd_card_get_index(const char *string)
 	    (isdigit(*string) && isdigit(*(string + 1)) && *(string + 2) == 0)) {
 		if (sscanf(string, "%i", &card) != 1)
 			return -EINVAL;
-		if (card < 0 || card > 31)
+		if (card < 0 || card >= SND_MAX_CARDS)
 			return -EINVAL;
 		err = snd_card_load1(card);
 		if (err >= 0)
@@ -143,7 +144,7 @@ int snd_card_get_index(const char *string)
 	}
 	if (string[0] == '/')	/* device name */
 		return snd_card_load2(string);
-	for (card = 0; card < 32; card++) {
+	for (card = 0; card < SND_MAX_CARDS; card++) {
 #ifdef SUPPORT_ALOAD
 		if (! snd_card_load(card))
 			continue;
@@ -166,13 +167,16 @@ int snd_card_get_index(const char *string)
  * \param card Card number
  * \param name Result - card name corresponding to card number
  * \result zero if success, otherwise a negative error code
+ *
+ * The value returned in name is allocated with strdup and should be
+ * freed when no longer used.
  */
 int snd_card_get_name(int card, char **name)
 {
 	snd_ctl_t *handle;
 	snd_ctl_card_info_t info;
 	int err;
-	
+
 	if (name == NULL)
 		return -EINVAL;
 	if ((err = snd_ctl_hw_open(&handle, NULL, card, 0)) < 0)
@@ -193,13 +197,16 @@ int snd_card_get_name(int card, char **name)
  * \param card Card number
  * \param name Result - card long name corresponding to card number
  * \result zero if success, otherwise a negative error code
+ *
+ * The value returned in name is allocated with strdup and should be
+ * freed when no longer used.
  */
 int snd_card_get_longname(int card, char **name)
 {
 	snd_ctl_t *handle;
 	snd_ctl_card_info_t info;
 	int err;
-	
+
 	if (name == NULL)
 		return -EINVAL;
 	if ((err = snd_ctl_hw_open(&handle, NULL, card, 0)) < 0)
