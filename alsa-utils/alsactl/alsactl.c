@@ -30,7 +30,9 @@
 #include <alsa/asoundlib.h>
 #include "alsactl.h"
 
-#define SYS_ASOUNDRC "/etc/asound.state"
+#ifndef SYS_ASOUNDRC
+#define SYS_ASOUNDRC "/var/lib/alsa/asound.state"
+#endif
 
 int debugflag = 0;
 int force_restore = 1;
@@ -66,8 +68,6 @@ static void help(void)
 	printf("  restore <card #> load current driver setup for one or each soundcards\n");
 	printf("                   from configuration file\n");
 	printf("  init	  <card #> initialize driver to a default state\n");
-	printf("  names   <card #> dump information about all the known present (sub-)devices\n");
-	printf("                   into configuration file (DEPRECATED)\n");
 }
 
 int main(int argc, char *argv[])
